@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import logging
+import math
+from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
+import pandas as pd
 import typer
 
+from .analysis import FakeoutConfig, FakeoutStats, FakeoutSummary, analyze_fakeouts
 from .cpi_loader import CPIColumnConfig, load_cpi_from_csv, load_sample_cpi_data
 from .logging_config import configure_logging
+from .price_loader import load_price_series_from_csv, load_sample_price_series
 from .settings import Settings, get_settings
 
 app = typer.Typer(
@@ -19,6 +25,8 @@ app = typer.Typer(
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_DATA_PATH = Path("data") / "btc_market_data.csv"
+_DEFAULT_OUTPUT_PATH = Path("data") / "fakeout_analysis.csv"
+_DEFAULT_ANALYSIS_CONFIG = FakeoutConfig()
 
 
 def _normalize_optional_column(column_name: Optional[str]) -> Optional[str]:
@@ -28,6 +36,165 @@ def _normalize_optional_column(column_name: Optional[str]) -> Optional[str]:
     if not trimmed or trimmed.lower() == "none":
         return None
     return trimmed
+
+
+def _normalize_timezone_option(value: str) -> Optional[str]:
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "none":
+        return None
+    return normalized
+
+
+def _parse_window_expression(value: str) -> tuple[str, timedelta]:
+    original = value.strip()
+    if not original:
+        raise ValueError("Window duration cannot be empty")
+
+    normalized = original.lower()
+    if normalized.endswith("m"):
+        unit = "m"
+        magnitude_str = normalized[:-1]
+    elif normalized.endswith("h"):
+        unit = "h"
+        magnitude_str = normalized[:-1]
+    else:
+        raise ValueError("Window definitions must end with 'm' or 'h'")
+
+    try:
+        magnitude = int(magnitude_str)
+    except ValueError as exc:  # pragma: no cover - defensive parsing
+        raise ValueError(f"Invalid window magnitude: {original}") from exc
+
+    if magnitude <= 0:
+        raise ValueError("Window duration must be positive")
+
+    if unit == "m":
+        delta = timedelta(minutes=magnitude)
+    else:
+        delta = timedelta(hours=magnitude)
+
+    label = f"{magnitude}{unit}"
+    return label, delta
+
+
+def _coerce_windows(
+    defaults: Sequence[tuple[str, timedelta]],
+    overrides: Sequence[str],
+) -> tuple[tuple[str, timedelta], ...]:
+    if not overrides:
+        return tuple(defaults)
+
+    parsed: dict[str, timedelta] = {}
+    for value in overrides:
+        label, delta = _parse_window_expression(value)
+        parsed[label] = delta
+    return tuple((label, parsed[label]) for label in parsed)
+
+
+def _format_percentage(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if math.isnan(value):
+            return "n/a"
+    except TypeError:  # pragma: no cover - defensive guard
+        return "n/a"
+    return f"{value * 100:.2f}%"
+
+
+def _format_ratio(stats: Optional[FakeoutStats]) -> str:
+    if stats is None:
+        return "n/a"
+    if stats.total == 0:
+        return "n/a"
+    ratio = stats.fake_ratio
+    if ratio is None:
+        return "n/a"
+    return f"{stats.fake_count}/{stats.total} ({ratio * 100:.1f}%)"
+
+
+@lru_cache(maxsize=8)
+def _cached_price_series(
+    source: str,
+    timestamp_column: str,
+    close_column: str,
+    timezone_value: Optional[str],
+) -> pd.Series:
+    if source == "__sample__":
+        return load_sample_price_series(
+            timestamp_column=timestamp_column,
+            close_column=close_column,
+            input_timezone=timezone_value,
+        )
+    return load_price_series_from_csv(
+        source,
+        timestamp_column=timestamp_column,
+        close_column=close_column,
+        input_timezone=timezone_value,
+    )
+
+
+def _print_summary(summary: FakeoutSummary, config: FakeoutConfig) -> None:
+    typer.echo(f"Analysis complete for {summary.event_count} CPI releases.")
+    typer.echo("Fake-out rates:")
+    for reaction_label, _ in config.reaction_windows:
+        for evaluation_label, _ in config.evaluation_windows:
+            stats = summary.fake_out_stats.get(reaction_label, {}).get(evaluation_label)
+            typer.echo(f"  {reaction_label} -> {evaluation_label}: {_format_ratio(stats)}")
+
+    typer.echo("Average returns (%):")
+    typer.echo("  Reaction windows:")
+    for reaction_label, _ in config.reaction_windows:
+        value = summary.average_returns.get("reaction", {}).get(reaction_label)
+        typer.echo(f"    {reaction_label}: {_format_percentage(value)}")
+
+    typer.echo("  Evaluation windows:")
+    for evaluation_label, _ in config.evaluation_windows:
+        value = summary.average_returns.get("evaluation", {}).get(evaluation_label)
+        typer.echo(f"    {evaluation_label}: {_format_percentage(value)}")
+
+    typer.echo("Correlation with CPI surprise:")
+    for evaluation_label, _ in config.evaluation_windows:
+        value = summary.surprise_correlations.get(evaluation_label)
+        if value is None or math.isnan(value):
+            typer.echo(f"  {evaluation_label}: n/a")
+        else:
+            typer.echo(f"  {evaluation_label}: {value:.3f}")
+
+
+def _export_report(events: pd.DataFrame, destination: Path, fmt: str) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        events.to_csv(destination, index=False)
+    elif fmt == "json":
+        events.to_json(destination, orient="records", date_format="iso")
+    else:  # pragma: no cover - validated earlier
+        raise ValueError(f"Unsupported output format: {fmt}")
+
+
+def _render_plot(events: pd.DataFrame, config: FakeoutConfig) -> None:
+    if events.empty:
+        typer.echo("No analysis events available to plot.")
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:  # pragma: no cover - optional dependency
+        typer.echo("Matplotlib is not installed; skipping plot generation.")
+        return
+
+    time_values = events["release_datetime"]
+    for label, _ in config.evaluation_windows:
+        series = events[f"return_{label}"] * 100.0
+        plt.plot(time_values, series, marker="o", label=f"{label} return")
+
+    plt.axhline(0.0, color="black", linewidth=0.8)
+    plt.ylabel("Return (%)")
+    plt.title("BTC performance after CPI releases")
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 @app.callback()
@@ -213,39 +380,215 @@ def cpi_summary(
 
 @app.command()
 def analyze(
-    _ctx: typer.Context,
+    ctx: typer.Context,
     strategy: str = typer.Option(
-        "buy-and-hold",
+        "fake-moving-average",
         "--strategy",
         "-s",
-        help="Strategy name to evaluate.",
+        help="Label for the analysis run (for logging purposes).",
         show_default=True,
     ),
     lookback_days: int = typer.Option(
         365,
         "--lookback-days",
         "-n",
-        help="Historical window to evaluate performance over.",
+        help="How many days prior to the first CPI release to retain from price data.",
         show_default=True,
     ),
-    output: Optional[Path] = typer.Option(
-        None,
+    cpi_source: str = typer.Option(
+        "sample",
+        "--cpi-source",
+        help="Path to a CPI CSV file or 'sample' to use the bundled dataset.",
+        show_default=True,
+    ),
+    price_source: str = typer.Option(
+        "sample",
+        "--price-source",
+        "-p",
+        help="Path to a BTC price CSV file or 'sample' for the bundled dataset.",
+        show_default=True,
+    ),
+    timestamp_column: str = typer.Option(
+        "release_time",
+        "--timestamp-column",
+        help="CPI column containing release timestamps.",
+        show_default=True,
+    ),
+    actual_column: str = typer.Option(
+        "actual",
+        "--actual-column",
+        help="CPI column containing actual CPI values.",
+        show_default=True,
+    ),
+    expected_column: str = typer.Option(
+        "expected",
+        "--expected-column",
+        help="CPI column containing expected CPI values.",
+        show_default=True,
+    ),
+    surprise_column: Optional[str] = typer.Option(
+        "surprise",
+        "--surprise-column",
+        help="CPI column containing surprise values (set to 'none' if unavailable).",
+        show_default=True,
+    ),
+    cpi_timezone: str = typer.Option(
+        "UTC",
+        "--cpi-timezone",
+        help="Timezone for naive CPI timestamps (use 'none' to leave unspecified).",
+        show_default=True,
+    ),
+    price_timestamp_column: str = typer.Option(
+        "timestamp",
+        "--price-timestamp-column",
+        help="Price column containing candle timestamps.",
+        show_default=True,
+    ),
+    price_close_column: str = typer.Option(
+        "close",
+        "--price-close-column",
+        help="Price column containing close values.",
+        show_default=True,
+    ),
+    price_timezone: str = typer.Option(
+        "UTC",
+        "--price-timezone",
+        help="Timezone for naive price timestamps (use 'none' to leave unspecified).",
+        show_default=True,
+    ),
+    reaction_window: Sequence[str] = typer.Option(
+        [],
+        "--reaction-window",
+        help="Override reaction window durations (e.g., '--reaction-window 10m').",
+    ),
+    evaluation_window: Sequence[str] = typer.Option(
+        [],
+        "--evaluation-window",
+        help="Override evaluation window durations (e.g., '--evaluation-window 90m').",
+    ),
+    output: Path = typer.Option(
+        _DEFAULT_OUTPUT_PATH,
         "--output",
         "-o",
-        help="Optional path to export analysis results.",
+        help="Destination for the detailed per-release analysis report.",
+        show_default=True,
+    ),
+    output_format: str = typer.Option(
+        "csv",
+        "--output-format",
+        "-f",
+        help="Format for the detailed report (csv or json).",
+        show_default=True,
+    ),
+    plot: bool = typer.Option(
+        False,
+        "--plot/--no-plot",
+        help="Generate a matplotlib plot showing evaluation window returns.",
+        show_default=False,
     ),
 ) -> None:
-    """Analyze CPI-relative performance for a placeholder trading strategy."""
+    """Evaluate BTC reactions to CPI releases and highlight potential fake moves."""
 
     _LOGGER.info(
-        "Running analysis for strategy '%s' over %s days (output=%s)",
+        "Running fake move analysis (strategy=%s, cpi_source=%s, price_source=%s, output=%s)",
         strategy,
-        lookback_days,
-        output or "stdout",
+        cpi_source,
+        price_source,
+        output,
     )
-    typer.echo(
-        "Analysis not yet implemented. This command will evaluate strategies in a later release."
+
+    columns = CPIColumnConfig(
+        timestamp=timestamp_column,
+        actual=actual_column,
+        expected=expected_column,
+        surprise=_normalize_optional_column(surprise_column),
     )
+
+    cpi_timezone_arg = _normalize_timezone_option(cpi_timezone)
+
+    try:
+        if cpi_source.lower() == "sample":
+            releases = load_sample_cpi_data(columns=columns, input_timezone=cpi_timezone_arg)
+            cpi_label = "bundled sample dataset"
+        else:
+            cpi_path = Path(cpi_source)
+            releases = load_cpi_from_csv(cpi_path, columns=columns, input_timezone=cpi_timezone_arg)
+            cpi_label = str(cpi_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if not releases:
+        typer.echo(f"No CPI releases found in {cpi_source}.")
+        return
+
+    try:
+        reaction_windows = _coerce_windows(_DEFAULT_ANALYSIS_CONFIG.reaction_windows, reaction_window)
+        evaluation_windows = _coerce_windows(
+            _DEFAULT_ANALYSIS_CONFIG.evaluation_windows,
+            evaluation_window,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    analysis_config = FakeoutConfig(
+        reaction_windows=reaction_windows,
+        evaluation_windows=evaluation_windows,
+        tolerance=_DEFAULT_ANALYSIS_CONFIG.tolerance,
+    )
+
+    price_timezone_arg = _normalize_timezone_option(price_timezone)
+
+    try:
+        if price_source.lower() == "sample":
+            price_series = _cached_price_series(
+                "__sample__",
+                price_timestamp_column,
+                price_close_column,
+                price_timezone_arg,
+            ).copy()
+            price_label = "bundled sample price dataset"
+        else:
+            price_path = Path(price_source)
+            price_series = _cached_price_series(
+                str(price_path.resolve()),
+                price_timestamp_column,
+                price_close_column,
+                price_timezone_arg,
+            ).copy()
+            price_label = str(price_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    earliest_release = min(release.release_datetime for release in releases)
+    start_time = earliest_release - timedelta(days=lookback_days)
+    price_series = price_series.loc[start_time:]
+
+    max_eval_delta = max(delta for _, delta in analysis_config.evaluation_windows)
+    latest_release = max(release.release_datetime for release in releases)
+    end_time = latest_release + max_eval_delta
+    price_series = price_series.loc[: end_time + timedelta(minutes=5)]
+
+    if price_series.empty:
+        typer.echo("Price dataset does not cover the requested analysis period.")
+        return
+
+    typer.echo(f"Loaded {len(releases)} CPI releases from {cpi_label}.")
+    typer.echo(f"Using {len(price_series)} BTC price points from {price_label}.")
+
+    result = analyze_fakeouts(releases, price_series, config=analysis_config)
+
+    _print_summary(result.summary, analysis_config)
+
+    fmt = output_format.strip().lower()
+    if fmt not in {"csv", "json"}:
+        raise typer.BadParameter("output-format must be either 'csv' or 'json'")
+
+    _export_report(result.events, output, fmt)
+    typer.echo(f"Saved detailed report to {output.resolve()}")
+
+    if plot:
+        _render_plot(result.events, analysis_config)
+
 
 def main() -> None:
     """Invoke the Typer application."""
