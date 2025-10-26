@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=65.5", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btc-cpi-backtest"
+version = "0.1.0"
+description = "Backtesting utilities for exploring Bitcoin performance relative to CPI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "BTC CPI Backtest Maintainers"}
+]
+dependencies = [
+    "ccxt>=4.1",
+    "numpy>=1.24",
+    "pandas>=1.5",
+    "pydantic>=1.10",
+    "python-dotenv>=1.0",
+    "typer>=0.9",
+]
+
+[project.optional-dependencies]
+visualization = [
+    "matplotlib>=3.7",
+    "plotly>=5.15",
+]
+dev = [
+    "pytest>=7.4",
+    "typer[all]>=0.9",
+]
+
+[project.entry-points."console_scripts"]
+"btc-cpi-backtest" = "btc_cpi_backtest.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+btc_cpi_backtest = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = ["-ra", "--strict-markers", "--disable-warnings"]
