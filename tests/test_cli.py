@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pandas as pd
 from typer.testing import CliRunner
 
 from btc_cpi_backtest.cli import app
@@ -33,8 +34,27 @@ def test_cpi_summary_sample_dataset() -> None:
     assert "2023-12-12T13:30:00+00:00" in result.stdout
 
 
-def test_analyze_placeholder_runs() -> None:
-    result = runner.invoke(app, ["analyze"])
+def test_analyze_generates_report(tmp_path) -> None:
+    output_path = tmp_path / "fakeout_report.csv"
+    result = runner.invoke(
+        app,
+        [
+            "analyze",
+            "--output",
+            str(output_path),
+            "--cpi-source",
+            "sample",
+            "--price-source",
+            "sample",
+        ],
+    )
 
     assert result.exit_code == 0
-    assert "Analysis not yet implemented" in result.stdout
+    assert "Analysis complete for" in result.stdout
+    assert "Fake-out rates" in result.stdout
+    assert "Saved detailed report to" in result.stdout
+    assert output_path.exists()
+
+    df = pd.read_csv(output_path)
+    assert not df.empty
+    assert "fake_5m_1h" in df.columns
