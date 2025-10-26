@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,7 @@ import typer
 
 from .cpi_loader import CPIColumnConfig, load_cpi_from_csv, load_sample_cpi_data
 from .logging_config import configure_logging
+from .market_data import download_cpi_market_data, timeframe_to_seconds
 from .settings import Settings, get_settings
 
 app = typer.Typer(
@@ -18,7 +20,7 @@ app = typer.Typer(
 )
 
 _LOGGER = logging.getLogger(__name__)
-_DEFAULT_DATA_PATH = Path("data") / "btc_market_data.csv"
+_DEFAULT_CACHE_DIR = Path("data") / "btc_cpi_cache"
 
 
 def _normalize_optional_column(column_name: Optional[str]) -> Optional[str]:
@@ -28,6 +30,18 @@ def _normalize_optional_column(column_name: Optional[str]) -> Optional[str]:
     if not trimmed or trimmed.lower() == "none":
         return None
     return trimmed
+
+
+def _parse_datetime_option(value: Optional[str], option_name: str) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:  # pragma: no cover - validated via CLI
+        raise typer.BadParameter(f"Invalid ISO datetime for {option_name}: {value}") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @app.callback()
@@ -74,24 +88,23 @@ def fetch_data(
         help="Trading pair symbol to pull data for.",
     ),
     timeframe: str = typer.Option(
-        "1d",
+        "1m",
         "--timeframe",
         "-t",
         help="CCXT timeframe for the OHLCV data.",
         show_default=True,
     ),
-    limit: int = typer.Option(
-        365,
-        "--limit",
-        "-n",
-        help="Number of candles to download from the exchange.",
+    cpi_source: str = typer.Option(
+        "sample",
+        "--cpi-source",
+        "-c",
+        help="Path to a CPI CSV file or 'sample' to use the bundled dataset.",
         show_default=True,
     ),
-    destination: Path = typer.Option(
-        _DEFAULT_DATA_PATH,
-        "--destination",
-        "-d",
-        help="Where to save the downloaded market data.",
+    cache_dir: Path = typer.Option(
+        _DEFAULT_CACHE_DIR,
+        "--cache-dir",
+        help="Directory where candle data should be cached.",
         show_default=True,
     ),
     sandbox: bool = typer.Option(
@@ -100,8 +113,25 @@ def fetch_data(
         help="Whether to use the exchange sandbox/testnet if available.",
         show_default=True,
     ),
+    start: Optional[str] = typer.Option(
+        None,
+        "--start",
+        help="Optional ISO-8601 timestamp (UTC) for the earliest CPI release to include.",
+    ),
+    end: Optional[str] = typer.Option(
+        None,
+        "--end",
+        help="Optional ISO-8601 timestamp (UTC) for the latest CPI release to include.",
+    ),
+    lookback_years: int = typer.Option(
+        3,
+        "--years",
+        min=1,
+        help="Number of years to look back when no --start value is provided.",
+        show_default=True,
+    ),
 ) -> None:
-    """Fetch market data using CCXT (placeholder implementation)."""
+    """Fetch BTC candles around CPI releases with caching."""
 
     settings_obj = ctx.obj.get("settings")
     if isinstance(settings_obj, Settings):
@@ -110,19 +140,73 @@ def fetch_data(
         settings = get_settings()
         ctx.obj["settings"] = settings
 
+    try:
+        timeframe_to_seconds(timeframe)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    start_dt = _parse_datetime_option(start, "--start")
+    end_dt = _parse_datetime_option(end, "--end")
+    if start_dt and end_dt and start_dt >= end_dt:
+        raise typer.BadParameter("--start must be earlier than --end")
+
+    now_utc = datetime.now(timezone.utc)
+    if start_dt is None:
+        start_dt = now_utc - timedelta(days=lookback_years * 365)
+    if end_dt is None:
+        end_dt = now_utc
+
+    cache_dir = cache_dir.expanduser()
+
+    columns = CPIColumnConfig()
+    try:
+        if cpi_source.lower() == "sample":
+            releases = load_sample_cpi_data(columns=columns, input_timezone=timezone.utc)
+            source_label = "bundled sample dataset"
+        else:
+            path = Path(cpi_source)
+            releases = load_cpi_from_csv(path, columns=columns, input_timezone=timezone.utc)
+            source_label = str(path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    exchange_name = exchange.strip().lower()
+    if not exchange_name:
+        raise typer.BadParameter("Exchange name must not be empty.")
+
     _LOGGER.info(
-        "Fetching %s candles for %s on %s (sandbox=%s) -> %s",
-        limit,
+        "Starting CPI candle download: exchange=%s symbol=%s timeframe=%s cache=%s",
+        exchange_name,
         symbol,
-        exchange,
-        sandbox,
-        destination,
+        timeframe,
+        cache_dir,
     )
-    if settings.ccxt_api_key:
-        _LOGGER.debug("CCXT API key detected; authenticated requests are available.")
+    _LOGGER.info(
+        "CPI releases considered from %s to %s using source %s",
+        start_dt.isoformat(),
+        end_dt.isoformat(),
+        source_label,
+    )
+
+    summary = download_cpi_market_data(
+        exchange_name=exchange_name,
+        symbol=symbol,
+        timeframe=timeframe,
+        releases=releases,
+        cache_dir=cache_dir,
+        settings=settings,
+        sandbox=sandbox,
+        start=start_dt,
+        end=end_dt,
+    )
+
     typer.echo(
-        "Download not yet implemented. This command will fetch data in a future iteration."
+        f"Processed {summary.total_releases} CPI releases from {source_label}."
     )
+    typer.echo(
+        f"Downloaded: {summary.downloaded}, Reused cache: {summary.reused}, Candles: {summary.total_candles}"
+    )
+    typer.echo(f"Cache directory: {cache_dir}")
 
 
 @app.command("cpi-summary")
