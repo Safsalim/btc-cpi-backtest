@@ -13,7 +13,7 @@ import pandas as pd
 import typer
 
 from .analysis import FakeoutConfig, FakeoutStats, FakeoutSummary, analyze_fakeouts
-from .cpi_loader import CPIColumnConfig, load_cpi_from_csv, load_sample_cpi_data
+from .cpi_loader import CPIColumnConfig, CPIRelease, load_cpi_from_csv, load_sample_cpi_data
 from .logging_config import configure_logging
 from .price_loader import load_price_series_from_csv, load_sample_price_series
 from .settings import Settings, get_settings
@@ -25,6 +25,8 @@ app = typer.Typer(
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_DATA_PATH = Path("data") / "btc_market_data.csv"
+_DEFAULT_BTC_DATA_PATH = Path("btcusd_1-min_data.csv")
+_DEFAULT_CPI_DATA_PATH = Path("data") / "cpi_releases.csv"
 _DEFAULT_OUTPUT_PATH = Path("data") / "fakeout_analysis.csv"
 _DEFAULT_ANALYSIS_CONFIG = FakeoutConfig()
 
@@ -195,6 +197,43 @@ def _render_plot(events: pd.DataFrame, config: FakeoutConfig) -> None:
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+
+def _warn_on_price_coverage(
+    price_series: pd.Series,
+    releases: Sequence[CPIRelease],
+    evaluation_windows: Sequence[tuple[str, timedelta]],
+) -> None:
+    if price_series.empty or not releases:
+        return
+
+    first_timestamp = price_series.index.min()
+    missing_before = sum(
+        1 for release in releases if release.release_datetime < first_timestamp
+    )
+    if missing_before:
+        _LOGGER.warning(
+            "Price data begins at %s; %d CPI releases occur before this time and may lack price coverage.",
+            first_timestamp.isoformat(),
+            missing_before,
+        )
+
+    if not evaluation_windows:
+        return
+
+    max_eval_delta = max(delta for _, delta in evaluation_windows)
+    last_timestamp = price_series.index.max()
+    missing_after = sum(
+        1
+        for release in releases
+        if release.release_datetime + max_eval_delta > last_timestamp
+    )
+    if missing_after:
+        _LOGGER.warning(
+            "Price data ends at %s; %d CPI releases extend beyond the available candles. Evaluation windows may be incomplete.",
+            last_timestamp.isoformat(),
+            missing_after,
+        )
 
 
 @app.callback()
@@ -395,40 +434,41 @@ def analyze(
         help="How many days prior to the first CPI release to retain from price data.",
         show_default=True,
     ),
-    cpi_source: str = typer.Option(
-        "sample",
-        "--cpi-source",
-        help="Path to a CPI CSV file or 'sample' to use the bundled dataset.",
+    btc_data: Path = typer.Option(
+        _DEFAULT_BTC_DATA_PATH,
+        "--btc-data",
+        "-b",
+        help="Path to a BTC OHLCV CSV file.",
         show_default=True,
     ),
-    price_source: str = typer.Option(
-        "sample",
-        "--price-source",
-        "-p",
-        help="Path to a BTC price CSV file or 'sample' for the bundled dataset.",
+    cpi_data: Path = typer.Option(
+        _DEFAULT_CPI_DATA_PATH,
+        "--cpi-data",
+        "-c",
+        help="Path to a CPI release CSV file.",
         show_default=True,
     ),
-    timestamp_column: str = typer.Option(
+    cpi_timestamp_column: str = typer.Option(
         "release_time",
-        "--timestamp-column",
+        "--cpi-timestamp-column",
         help="CPI column containing release timestamps.",
         show_default=True,
     ),
-    actual_column: str = typer.Option(
+    cpi_actual_column: str = typer.Option(
         "actual",
-        "--actual-column",
+        "--cpi-actual-column",
         help="CPI column containing actual CPI values.",
         show_default=True,
     ),
-    expected_column: str = typer.Option(
+    cpi_expected_column: str = typer.Option(
         "expected",
-        "--expected-column",
+        "--cpi-expected-column",
         help="CPI column containing expected CPI values.",
         show_default=True,
     ),
-    surprise_column: Optional[str] = typer.Option(
+    cpi_surprise_column: Optional[str] = typer.Option(
         "surprise",
-        "--surprise-column",
+        "--cpi-surprise-column",
         help="CPI column containing surprise values (set to 'none' if unavailable).",
         show_default=True,
     ),
@@ -438,22 +478,22 @@ def analyze(
         help="Timezone for naive CPI timestamps (use 'none' to leave unspecified).",
         show_default=True,
     ),
-    price_timestamp_column: str = typer.Option(
-        "timestamp",
-        "--price-timestamp-column",
-        help="Price column containing candle timestamps.",
+    btc_timestamp_column: str = typer.Option(
+        "Timestamp",
+        "--btc-timestamp-column",
+        help="BTC column containing candle timestamps.",
         show_default=True,
     ),
-    price_close_column: str = typer.Option(
-        "close",
-        "--price-close-column",
-        help="Price column containing close values.",
+    btc_close_column: str = typer.Option(
+        "Close",
+        "--btc-close-column",
+        help="BTC column containing close values.",
         show_default=True,
     ),
-    price_timezone: str = typer.Option(
+    btc_timezone: str = typer.Option(
         "UTC",
-        "--price-timezone",
-        help="Timezone for naive price timestamps (use 'none' to leave unspecified).",
+        "--btc-timezone",
+        help="Timezone for naive BTC timestamps (use 'none' to leave unspecified).",
         show_default=True,
     ),
     reaction_window: List[str] = typer.Option(
@@ -490,35 +530,41 @@ def analyze(
     """Evaluate BTC reactions to CPI releases and highlight potential fake moves."""
 
     _LOGGER.info(
-        "Running fake move analysis (strategy=%s, cpi_source=%s, price_source=%s, output=%s)",
+        "Running fake move analysis (strategy=%s, cpi_data=%s, btc_data=%s, output=%s)",
         strategy,
-        cpi_source,
-        price_source,
+        cpi_data,
+        btc_data,
         output,
     )
 
     columns = CPIColumnConfig(
-        timestamp=timestamp_column,
-        actual=actual_column,
-        expected=expected_column,
-        surprise=_normalize_optional_column(surprise_column),
+        timestamp=cpi_timestamp_column,
+        actual=cpi_actual_column,
+        expected=cpi_expected_column,
+        surprise=_normalize_optional_column(cpi_surprise_column),
     )
 
     cpi_timezone_arg = _normalize_timezone_option(cpi_timezone)
 
+    cpi_label: str
+    cpi_data_str = str(cpi_data)
     try:
-        if cpi_source.lower() == "sample":
+        if cpi_data_str.lower() == "sample":
             releases = load_sample_cpi_data(columns=columns, input_timezone=cpi_timezone_arg)
-            cpi_label = "bundled sample dataset"
+            cpi_label = "bundled sample CPI dataset"
         else:
-            cpi_path = Path(cpi_source)
+            cpi_path = Path(cpi_data)
+            if not cpi_path.exists() and cpi_path.parent == Path("."):
+                candidate_path = Path("data") / cpi_path.name
+                if candidate_path.exists():
+                    cpi_path = candidate_path
             releases = load_cpi_from_csv(cpi_path, columns=columns, input_timezone=cpi_timezone_arg)
             cpi_label = str(cpi_path)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     if not releases:
-        typer.echo(f"No CPI releases found in {cpi_source}.")
+        typer.echo(f"No CPI releases found in {cpi_label}.")
         return
 
     try:
@@ -536,26 +582,32 @@ def analyze(
         tolerance=_DEFAULT_ANALYSIS_CONFIG.tolerance,
     )
 
-    price_timezone_arg = _normalize_timezone_option(price_timezone)
+    btc_timezone_arg = _normalize_timezone_option(btc_timezone)
 
+    btc_label: str
+    btc_data_str = str(btc_data)
     try:
-        if price_source.lower() == "sample":
+        if btc_data_str.lower() == "sample":
             price_series = _cached_price_series(
                 "__sample__",
-                price_timestamp_column,
-                price_close_column,
-                price_timezone_arg,
+                btc_timestamp_column,
+                btc_close_column,
+                btc_timezone_arg,
             ).copy()
-            price_label = "bundled sample price dataset"
+            btc_label = "bundled sample price dataset"
         else:
-            price_path = Path(price_source)
+            btc_path = Path(btc_data)
+            if not btc_path.exists() and btc_path.parent == Path("."):
+                candidate_path = Path("data") / btc_path.name
+                if candidate_path.exists():
+                    btc_path = candidate_path
             price_series = _cached_price_series(
-                str(price_path.resolve()),
-                price_timestamp_column,
-                price_close_column,
-                price_timezone_arg,
+                str(btc_path.resolve()),
+                btc_timestamp_column,
+                btc_close_column,
+                btc_timezone_arg,
             ).copy()
-            price_label = str(price_path)
+            btc_label = str(btc_path)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -563,7 +615,10 @@ def analyze(
     start_time = earliest_release - timedelta(days=lookback_days)
     price_series = price_series.loc[start_time:]
 
-    max_eval_delta = max(delta for _, delta in analysis_config.evaluation_windows)
+    if analysis_config.evaluation_windows:
+        max_eval_delta = max(delta for _, delta in analysis_config.evaluation_windows)
+    else:
+        max_eval_delta = timedelta(0)
     latest_release = max(release.release_datetime for release in releases)
     end_time = latest_release + max_eval_delta
     price_series = price_series.loc[: end_time + timedelta(minutes=5)]
@@ -572,8 +627,10 @@ def analyze(
         typer.echo("Price dataset does not cover the requested analysis period.")
         return
 
+    _warn_on_price_coverage(price_series, releases, analysis_config.evaluation_windows)
+
     typer.echo(f"Loaded {len(releases)} CPI releases from {cpi_label}.")
-    typer.echo(f"Using {len(price_series)} BTC price points from {price_label}.")
+    typer.echo(f"Using {len(price_series)} BTC price points from {btc_label}.")
 
     result = analyze_fakeouts(releases, price_series, config=analysis_config)
 

@@ -191,15 +191,15 @@ reaction followed by an opposing move within configurable windows).
 
 ```bash
 btc-cpi-backtest analyze \
-  --cpi-source sample \
-  --price-source sample \
+  --cpi-data data/cpi_releases.csv \
+  --btc-data btcusd_1-min_data.csv \
   --output data/fakeout_analysis.csv \
   --output-format csv \
   --reaction-window 10m \
   --reaction-window 30m \
   --evaluation-window 2h \
   --plot
-```
+
 
 Key options:
 
@@ -207,25 +207,26 @@ Key options:
 | ------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | `--strategy/-s`           | `fake-moving-average`       | Free-form label for the run; currently informational.                                                         |
 | `--lookback-days/-n`      | `365`                       | How many days of price history to retain before the earliest CPI release.                                     |
-| `--cpi-source`            | `sample`                    | Path to a CPI CSV or `sample` for the bundled dataset.                                                         |
-| `--price-source/-p`       | `sample`                    | Path to a BTC price CSV or `sample`.                                                                           |
-| `--timestamp-column`      | `release_time`              | CPI timestamp column name.                                                                                     |
-| `--actual-column`         | `actual`                    | CPI actual value column.                                                                                       |
-| `--expected-column`       | `expected`                  | CPI expected/consensus column.                                                                                  |
-| `--surprise-column`       | `surprise`                  | CPI surprise column (set to `none` when absent).                                                               |
-| `--cpi-timezone`          | `UTC`                       | Timezone applied to naive CPI timestamps (use `none` to leave naive).                                          |
-| `--price-timestamp-column`| `timestamp`                 | Price timestamp column.                                                                                        |
-| `--price-close-column`    | `close`                     | Price close column.                                                                                            |
-| `--price-timezone`        | `UTC`                       | Timezone for naive price timestamps.                                                                           |
+| `--cpi-data/-c`           | `data/cpi_releases.csv`     | Path to a CPI CSV file (use `sample` for the bundled dataset).                                                |
+| `--btc-data/-b`           | `btcusd_1-min_data.csv`     | Path to a BTC OHLCV CSV file (use `sample` for the bundled dataset).                                          |
+| `--cpi-timestamp-column`  | `release_time`              | CPI timestamp column name.                                                                                    |
+| `--cpi-actual-column`     | `actual`                    | CPI actual value column.                                                                                      |
+| `--cpi-expected-column`   | `expected`                  | CPI expected/consensus column.                                                                                |
+| `--cpi-surprise-column`   | `surprise`                  | CPI surprise column (set to `none` when absent).                                                              |
+| `--cpi-timezone`          | `UTC`                       | Timezone applied to naive CPI timestamps (use `none` to leave naive).                                         |
+| `--btc-timestamp-column`  | `Timestamp`                 | BTC candle timestamp column.                                                                                  |
+| `--btc-close-column`      | `Close`                     | BTC close column used for analysis.                                                                           |
+| `--btc-timezone`          | `UTC`                       | Timezone for naive BTC timestamps.                                                                            |
 | `--reaction-window`       | defaults: `5m`, `15m`, `30m`| Override reaction windows; values must end with `m` or `h` (e.g., `--reaction-window 45m`).                    |
 | `--evaluation-window`     | defaults: `1h`, `2h`, `4h`  | Override evaluation windows; same format as reaction windows.                                                 |
-| `--output/-o`             | `data/fakeout_analysis.csv` | Destination for the per-release report.                                                                        |
-| `--output-format/-f`      | `csv`                       | `csv` or `json`.                                                                                               |
-| `--plot/--no-plot`        | `False`                     | Generate a Matplotlib line plot of evaluation window returns (requires visualization extras).                  |
+| `--output/-o`             | `data/fakeout_analysis.csv` | Destination for the per-release report.                                                                       |
+| `--output-format/-f`      | `csv`                       | `csv` or `json`.                                                                                              |
+| `--plot/--no-plot`        | `False`                     | Generate a Matplotlib line plot of evaluation window returns (requires visualization extras).                 |
 
-Defaults are tuned for the bundled sample data—the CPI file contains three releases and the BTC sample includes
-21 candles centred around those events. When you provide custom datasets, ensure the price series covers the
-entire CPI window plus the largest evaluation horizon; otherwise the analysis will exit early.
+By default the command reads from `btcusd_1-min_data.csv` (minute-level BTC candles stored under `data/btcusd_1-min_data.csv`) and `data/cpi_releases.csv`.
+Use `--cpi-data sample --btc-data sample` to run against the lightweight bundled datasets.
+Ensure the price series spans the requested lookback and evaluation windows; if coverage is incomplete the CLI logs
+warnings and affected returns are reported as missing rather than aborting the run.
 
 ### Other CLI utilities
 
