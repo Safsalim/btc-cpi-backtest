@@ -340,38 +340,48 @@ def cpi_summary(
         help="Path to a CPI CSV file or 'sample' to use the bundled dataset.",
         show_default=True,
     ),
-    timestamp_column: str = typer.Option(
-        "release_time",
+    timestamp_column: Optional[str] = typer.Option(
+        None,
         "--timestamp-column",
-        help="Column name containing CPI release timestamps.",
+        help="Column name containing CPI release timestamps (set to 'none' when using separate date and time columns).",
+    ),
+    date_column: Optional[str] = typer.Option(
+        "Release Date",
+        "--date-column",
+        help="Column name containing the CPI release date (set to 'none' when a combined timestamp column is provided).",
+        show_default=True,
+    ),
+    time_column: Optional[str] = typer.Option(
+        "Time",
+        "--time-column",
+        help="Column name containing the CPI release time.",
         show_default=True,
     ),
     actual_column: str = typer.Option(
-        "actual",
+        "Actual",
         "--actual-column",
         help="Column name containing the actual CPI value.",
         show_default=True,
     ),
     expected_column: str = typer.Option(
-        "expected",
+        "Forecast",
         "--expected-column",
         help="Column name containing the expected CPI value.",
         show_default=True,
     ),
     previous_column: Optional[str] = typer.Option(
-        "previous",
+        "Previous",
         "--previous-column",
         help="Column name for the previous CPI value (set to 'none' if unavailable).",
         show_default=True,
     ),
     surprise_column: Optional[str] = typer.Option(
-        "surprise",
+        None,
         "--surprise-column",
         help="Column name for the CPI surprise value (set to 'none' if unavailable).",
-        show_default=True,
     ),
     input_timezone: str = typer.Option(
-        "UTC",
+        "US/Eastern",
         "--timezone",
         "-t",
         help="Timezone to assume for naive CPI timestamps (use 'none' to leave unspecified).",
@@ -381,9 +391,11 @@ def cpi_summary(
     """Load CPI data from CSV and print a release summary."""
 
     columns = CPIColumnConfig(
-        timestamp=timestamp_column,
-        actual=actual_column,
-        expected=expected_column,
+        timestamp=_normalize_optional_column(timestamp_column),
+        date=_normalize_optional_column(date_column),
+        time=_normalize_optional_column(time_column),
+        actual=actual_column.strip(),
+        expected=expected_column.strip(),
         previous=_normalize_optional_column(previous_column),
         surprise=_normalize_optional_column(surprise_column),
     )
@@ -448,32 +460,48 @@ def analyze(
         help="Path to a CPI release CSV file.",
         show_default=True,
     ),
-    cpi_timestamp_column: str = typer.Option(
-        "release_time",
+    cpi_timestamp_column: Optional[str] = typer.Option(
+        None,
         "--cpi-timestamp-column",
-        help="CPI column containing release timestamps.",
+        help="CPI column containing release timestamps (set to 'none' when using separate date and time columns).",
+    ),
+    cpi_date_column: Optional[str] = typer.Option(
+        "Release Date",
+        "--cpi-date-column",
+        help="CPI column containing release dates (set to 'none' when a combined timestamp column is provided).",
+        show_default=True,
+    ),
+    cpi_time_column: Optional[str] = typer.Option(
+        "Time",
+        "--cpi-time-column",
+        help="CPI column containing release times.",
         show_default=True,
     ),
     cpi_actual_column: str = typer.Option(
-        "actual",
+        "Actual",
         "--cpi-actual-column",
         help="CPI column containing actual CPI values.",
         show_default=True,
     ),
     cpi_expected_column: str = typer.Option(
-        "expected",
+        "Forecast",
         "--cpi-expected-column",
         help="CPI column containing expected CPI values.",
         show_default=True,
     ),
-    cpi_surprise_column: Optional[str] = typer.Option(
-        "surprise",
-        "--cpi-surprise-column",
-        help="CPI column containing surprise values (set to 'none' if unavailable).",
+    cpi_previous_column: Optional[str] = typer.Option(
+        "Previous",
+        "--cpi-previous-column",
+        help="CPI column containing previous CPI values (set to 'none' if unavailable).",
         show_default=True,
     ),
+    cpi_surprise_column: Optional[str] = typer.Option(
+        None,
+        "--cpi-surprise-column",
+        help="CPI column containing surprise values (set to 'none' if unavailable).",
+    ),
     cpi_timezone: str = typer.Option(
-        "UTC",
+        "US/Eastern",
         "--cpi-timezone",
         help="Timezone for naive CPI timestamps (use 'none' to leave unspecified).",
         show_default=True,
@@ -538,9 +566,12 @@ def analyze(
     )
 
     columns = CPIColumnConfig(
-        timestamp=cpi_timestamp_column,
-        actual=cpi_actual_column,
-        expected=cpi_expected_column,
+        timestamp=_normalize_optional_column(cpi_timestamp_column),
+        date=_normalize_optional_column(cpi_date_column),
+        time=_normalize_optional_column(cpi_time_column),
+        actual=cpi_actual_column.strip(),
+        expected=cpi_expected_column.strip(),
+        previous=_normalize_optional_column(cpi_previous_column),
         surprise=_normalize_optional_column(cpi_surprise_column),
     )
 

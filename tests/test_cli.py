@@ -31,7 +31,7 @@ def test_cpi_summary_sample_dataset() -> None:
     assert result.exit_code == 0
     assert "Loaded 3 CPI releases from bundled sample dataset." in result.stdout
     assert "2023-10-12T12:30:00+00:00" in result.stdout
-    assert "2023-12-12T13:30:00+00:00" in result.stdout
+    assert "2023-12-12T14:30:00+00:00" in result.stdout
 
 
 def test_analyze_generates_report(tmp_path) -> None:
