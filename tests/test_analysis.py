@@ -69,12 +69,26 @@ def test_fakeout_analysis_classifies_reversals() -> None:
     events = result.events
     assert len(events) == 3
 
+    assert events["surprise_type"].tolist() == ["positive", "negative", "met"]
+    assert events["initial_direction"].tolist() == ["up", "down", "up"]
+    assert pytest.approx(events.loc[0, "initial_move_magnitude"], rel=1e-6) == 0.02
+    assert pytest.approx(events.loc[1, "initial_move_magnitude"], rel=1e-6) == 0.025
+
     # First release: positive 5m move, negative 1h move -> fake-out
     assert events.loc[0, "fake_5m_1h"] is True
     # Second release: negative 5m move, positive 1h move -> fake-out
     assert events.loc[1, "fake_5m_1h"] is True
     # Third release: sustained positive move -> not a fake-out
     assert events.loc[2, "fake_5m_1h"] is False
+
+    # Fake move timing metrics captured for fake releases
+    assert pytest.approx(events.loc[0, "fake_reversal_minutes_5m_1h"], rel=1e-3) == 60.0
+    assert pytest.approx(events.loc[1, "fake_reversal_minutes_5m_1h"], rel=1e-3) == 60.0
+    assert math.isnan(events.loc[2, "fake_reversal_minutes_5m_1h"])
+
+    assert pytest.approx(events.loc[0, "fake_peak_return_5m_1h"], rel=1e-6) == 0.02
+    assert pytest.approx(events.loc[1, "fake_peak_return_5m_1h"], rel=1e-6) == 0.035
+    assert math.isnan(events.loc[2, "fake_peak_return_5m_1h"])
 
     # Missing 4h data for the third release should mark fake classification as None
     assert events.loc[2, "fake_5m_4h"] is None
@@ -91,6 +105,25 @@ def test_fakeout_analysis_classifies_reversals() -> None:
     correlation = summary.surprise_correlations["1h"]
     assert not math.isnan(correlation)
 
+    fakeout_correlation = summary.surprise_fakeout_correlations["1h"]
+    assert not math.isnan(fakeout_correlation)
+
+    timing_stats = summary.fakeout_timing["5m"]["1h"]
+    assert timing_stats.count == 2
+    assert pytest.approx(timing_stats.average_reversal_minutes, rel=1e-3) == 60.0
+    assert timing_stats.distribution["<= 60m"] == 2
+    assert pytest.approx(timing_stats.average_peak_return, rel=1e-6) == (0.02 + 0.035) / 2
+
+    breakdown = summary.surprise_breakdown
+    assert breakdown["positive"].count == 1
+    assert breakdown["positive"].direction_counts["up"] == 1
+    assert pytest.approx(breakdown["positive"].average_initial_move, rel=1e-6) == 0.02
+    assert breakdown["negative"].count == 1
+    assert breakdown["negative"].direction_counts["down"] == 1
+    assert pytest.approx(breakdown["negative"].average_initial_move, rel=1e-6) == 0.025
+    assert breakdown["met"].count == 1
+    assert breakdown["met"].direction_counts["up"] == 1
+
 
 def test_analyze_fakeouts_handles_missing_base_price() -> None:
     release = CPIRelease(
@@ -106,9 +139,13 @@ def test_analyze_fakeouts_handles_missing_base_price() -> None:
     result = analyze_fakeouts([release], price_series)
     events = result.events
 
+    assert events.loc[0, "surprise_type"] == "positive"
+    assert events.loc[0, "initial_direction"] == "unknown"
+    assert math.isnan(events.loc[0, "initial_move_magnitude"])
     assert events.loc[0, "base_price"] is None
     assert events.loc[0, "return_5m"] is None
     assert events.loc[0, "fake_5m_1h"] is None
+    assert math.isnan(events.loc[0, "fake_reversal_minutes_5m_1h"])
 
     stats = result.summary.fake_out_stats["5m"]["1h"]
     assert stats.total == 0
@@ -136,3 +173,4 @@ def test_custom_configuration_applies() -> None:
     events = result.events
     assert "return_10m" in events.columns
     assert events.loc[0, "fake_10m_1h"] is True
+    assert pytest.approx(events.loc[0, "fake_reversal_minutes_10m_1h"], rel=1e-3) == 60.0

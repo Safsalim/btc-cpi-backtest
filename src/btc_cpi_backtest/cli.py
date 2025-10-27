@@ -7,12 +7,17 @@ import math
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Literal, Optional, Sequence
 
 import pandas as pd
 import typer
 
-from .analysis import FakeoutConfig, FakeoutStats, FakeoutSummary, analyze_fakeouts
+from .analysis import (
+    FakeoutConfig,
+    FakeoutStats,
+    FakeoutSummary,
+    analyze_fakeouts,
+)
 from .cpi_loader import CPIColumnConfig, CPIRelease, load_cpi_from_csv, load_sample_cpi_data
 from .logging_config import configure_logging
 from .price_loader import load_price_series_from_csv, load_sample_price_series
@@ -29,6 +34,8 @@ _DEFAULT_BTC_DATA_PATH = Path("btcusd_1-min_data.csv")
 _DEFAULT_CPI_DATA_PATH = Path("data") / "cpi_releases.csv"
 _DEFAULT_OUTPUT_PATH = Path("data") / "fakeout_analysis.csv"
 _DEFAULT_ANALYSIS_CONFIG = FakeoutConfig()
+
+DetailLevel = Literal["basic", "detailed", "full"]
 
 
 def _normalize_optional_column(column_name: Optional[str]) -> Optional[str]:
@@ -115,6 +122,24 @@ def _format_ratio(stats: Optional[FakeoutStats]) -> str:
     return f"{stats.fake_count}/{stats.total} ({ratio * 100:.1f}%)"
 
 
+def _format_minutes(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        if math.isnan(value):
+            return "n/a"
+    except TypeError:
+        return "n/a"
+    return f"{value:.1f}m"
+
+
+def _format_distribution(distribution: dict[str, int]) -> str:
+    if not distribution:
+        return "n/a"
+    parts = [f"{label}: {count}" for label, count in distribution.items()]
+    return ", ".join(parts)
+
+
 @lru_cache(maxsize=8)
 def _cached_price_series(
     source: str,
@@ -136,7 +161,13 @@ def _cached_price_series(
     )
 
 
-def _print_summary(summary: FakeoutSummary, config: FakeoutConfig) -> None:
+def _print_summary(
+    summary: FakeoutSummary,
+    config: FakeoutConfig,
+    *,
+    detail_level: DetailLevel,
+    by_surprise: bool,
+) -> None:
     typer.echo(f"Analysis complete for {summary.event_count} CPI releases.")
     typer.echo("Fake-out rates:")
     for reaction_label, _ in config.reaction_windows:
@@ -144,24 +175,95 @@ def _print_summary(summary: FakeoutSummary, config: FakeoutConfig) -> None:
             stats = summary.fake_out_stats.get(reaction_label, {}).get(evaluation_label)
             typer.echo(f"  {reaction_label} -> {evaluation_label}: {_format_ratio(stats)}")
 
-    typer.echo("Average returns (%):")
-    typer.echo("  Reaction windows:")
-    for reaction_label, _ in config.reaction_windows:
-        value = summary.average_returns.get("reaction", {}).get(reaction_label)
-        typer.echo(f"    {reaction_label}: {_format_percentage(value)}")
+    if detail_level in {"detailed", "full"}:
+        typer.echo("Average returns (%):")
+        typer.echo("  Reaction windows:")
+        for reaction_label, _ in config.reaction_windows:
+            value = summary.average_returns.get("reaction", {}).get(reaction_label)
+            typer.echo(f"    {reaction_label}: {_format_percentage(value)}")
 
-    typer.echo("  Evaluation windows:")
-    for evaluation_label, _ in config.evaluation_windows:
-        value = summary.average_returns.get("evaluation", {}).get(evaluation_label)
-        typer.echo(f"    {evaluation_label}: {_format_percentage(value)}")
+        typer.echo("  Evaluation windows:")
+        for evaluation_label, _ in config.evaluation_windows:
+            value = summary.average_returns.get("evaluation", {}).get(evaluation_label)
+            typer.echo(f"    {evaluation_label}: {_format_percentage(value)}")
 
-    typer.echo("Correlation with CPI surprise:")
-    for evaluation_label, _ in config.evaluation_windows:
-        value = summary.surprise_correlations.get(evaluation_label)
-        if value is None or math.isnan(value):
-            typer.echo(f"  {evaluation_label}: n/a")
-        else:
-            typer.echo(f"  {evaluation_label}: {value:.3f}")
+        typer.echo("Correlation with CPI surprise (returns):")
+        for evaluation_label, _ in config.evaluation_windows:
+            value = summary.surprise_correlations.get(evaluation_label)
+            if value is None or math.isnan(value):
+                typer.echo(f"  {evaluation_label}: n/a")
+            else:
+                typer.echo(f"  {evaluation_label}: {value:.3f}")
+
+        typer.echo("Correlation between surprise magnitude and fake-out probability:")
+        for evaluation_label, _ in config.evaluation_windows:
+            value = summary.surprise_fakeout_correlations.get(evaluation_label)
+            if value is None or math.isnan(value):
+                typer.echo(f"  {evaluation_label}: n/a")
+            else:
+                typer.echo(f"  {evaluation_label}: {value:.3f}")
+
+    if detail_level in {"detailed", "full"}:
+        typer.echo("Fake move timing statistics:")
+        for reaction_label, _ in config.reaction_windows:
+            for evaluation_label, _ in config.evaluation_windows:
+                stats = summary.fakeout_timing.get(reaction_label, {}).get(evaluation_label)
+                if stats is None or stats.count == 0:
+                    typer.echo(f"  {reaction_label} -> {evaluation_label}: n/a")
+                    continue
+                typer.echo(
+                    f"  {reaction_label} -> {evaluation_label}: {stats.count} fake moves, "
+                    f"avg reversal {_format_minutes(stats.average_reversal_minutes)}, "
+                    f"avg peak {_format_percentage(stats.average_peak_return)}"
+                )
+                if detail_level == "full":
+                    typer.echo(f"    Distribution: {_format_distribution(stats.distribution)}")
+
+    if by_surprise:
+        typer.echo("Breakdown by surprise type:")
+        label_map = {
+            "positive": "Positive surprise",
+            "negative": "Negative surprise",
+            "met": "Met expectations",
+        }
+        for key in ("positive", "negative", "met"):
+            entry = summary.surprise_breakdown.get(key)
+            label = label_map.get(key, key.title())
+            if entry is None:
+                typer.echo(f"  {label}: n/a")
+                continue
+            typer.echo(f"  {label}: {entry.count} releases")
+            if entry.count == 0:
+                continue
+            up_pct = _format_percentage(entry.direction_percentages.get("up"))
+            down_pct = _format_percentage(entry.direction_percentages.get("down"))
+            line = f"    Initial direction: up {up_pct}, down {down_pct}"
+            flat_pct = entry.direction_percentages.get("flat")
+            unknown_pct = entry.direction_percentages.get("unknown")
+            if detail_level == "full" and (
+                (flat_pct is not None and not math.isnan(flat_pct))
+                or (unknown_pct is not None and not math.isnan(unknown_pct))
+            ):
+                line += f", flat {_format_percentage(flat_pct)}, unknown {_format_percentage(unknown_pct)}"
+            typer.echo(line)
+            typer.echo(f"    Avg initial move: {_format_percentage(entry.average_initial_move)}")
+            typer.echo("    Fake-out rates:")
+            for reaction_label, _ in config.reaction_windows:
+                for evaluation_label, _ in config.evaluation_windows:
+                    stats = entry.fake_out_stats.get(reaction_label, {}).get(evaluation_label)
+                    typer.echo(
+                        f"      {reaction_label} -> {evaluation_label}: {_format_ratio(stats)}"
+                    )
+            if detail_level in {"detailed", "full"}:
+                typer.echo("    Average returns (%):")
+                typer.echo("      Reaction:")
+                for reaction_label, _ in config.reaction_windows:
+                    value = entry.average_returns.get("reaction", {}).get(reaction_label)
+                    typer.echo(f"        {reaction_label}: {_format_percentage(value)}")
+                typer.echo("      Evaluation:")
+                for evaluation_label, _ in config.evaluation_windows:
+                    value = entry.average_returns.get("evaluation", {}).get(evaluation_label)
+                    typer.echo(f"        {evaluation_label}: {_format_percentage(value)}")
 
 
 def _export_report(events: pd.DataFrame, destination: Path, fmt: str) -> None:
@@ -174,7 +276,13 @@ def _export_report(events: pd.DataFrame, destination: Path, fmt: str) -> None:
         raise ValueError(f"Unsupported output format: {fmt}")
 
 
-def _render_plot(events: pd.DataFrame, config: FakeoutConfig) -> None:
+def _render_plot(
+    events: pd.DataFrame,
+    summary: FakeoutSummary,
+    config: FakeoutConfig,
+    *,
+    by_surprise: bool,
+) -> None:
     if events.empty:
         typer.echo("No analysis events available to plot.")
         return
@@ -195,6 +303,42 @@ def _render_plot(events: pd.DataFrame, config: FakeoutConfig) -> None:
     plt.title("BTC performance after CPI releases")
     plt.xticks(rotation=45)
     plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    if not by_surprise:
+        return
+
+    primary_reaction = config.reaction_windows[0][0] if config.reaction_windows else None
+    primary_evaluation = config.evaluation_windows[0][0] if config.evaluation_windows else None
+    if primary_reaction is None or primary_evaluation is None:
+        return
+
+    categories = []
+    values = []
+    for key, label in (
+        ("positive", "Positive"),
+        ("negative", "Negative"),
+        ("met", "Met"),
+    ):
+        entry = summary.surprise_breakdown.get(key)
+        if entry is None or entry.count == 0:
+            continue
+        stats = entry.fake_out_stats.get(primary_reaction, {}).get(primary_evaluation)
+        ratio = stats.fake_ratio if stats and stats.fake_ratio is not None else None
+        if ratio is None:
+            continue
+        categories.append(label)
+        values.append(ratio * 100.0)
+
+    if not values:
+        typer.echo("Insufficient data to plot surprise-type fake-out rates.")
+        return
+
+    plt.figure()
+    plt.bar(categories, values, color=["#2ca02c", "#d62728", "#1f77b4"])
+    plt.ylabel("Fake-out rate (%)")
+    plt.title(f"Fake-out rates by surprise type ({primary_reaction} -> {primary_evaluation})")
     plt.tight_layout()
     plt.show()
 
@@ -548,10 +692,22 @@ def analyze(
         help="Format for the detailed report (csv or json).",
         show_default=True,
     ),
+    detail_level: DetailLevel = typer.Option(
+        "basic",
+        "--detail-level",
+        help="Level of detail to include in console output.",
+        show_default=True,
+    ),
+    by_surprise: bool = typer.Option(
+        False,
+        "--by-surprise/--no-by-surprise",
+        help="Display metrics segmented by CPI surprise type.",
+        show_default=False,
+    ),
     plot: bool = typer.Option(
         False,
         "--plot/--no-plot",
-        help="Generate a matplotlib plot showing evaluation window returns.",
+        help="Generate visualizations summarizing the analysis.",
         show_default=False,
     ),
 ) -> None:
@@ -665,7 +821,7 @@ def analyze(
 
     result = analyze_fakeouts(releases, price_series, config=analysis_config)
 
-    _print_summary(result.summary, analysis_config)
+    _print_summary(result.summary, analysis_config, detail_level=detail_level, by_surprise=by_surprise)
 
     fmt = output_format.strip().lower()
     if fmt not in {"csv", "json"}:
@@ -675,7 +831,7 @@ def analyze(
     typer.echo(f"Saved detailed report to {output.resolve()}")
 
     if plot:
-        _render_plot(result.events, analysis_config)
+        _render_plot(result.events, result.summary, analysis_config, by_surprise=by_surprise)
 
 
 def main() -> None:

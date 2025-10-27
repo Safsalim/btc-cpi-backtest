@@ -58,3 +58,30 @@ def test_analyze_generates_report(tmp_path) -> None:
     df = pd.read_csv(output_path)
     assert not df.empty
     assert "fake_5m_1h" in df.columns
+    assert "surprise_type" in df.columns
+    assert "fake_reversal_minutes_5m_1h" in df.columns
+
+
+def test_analyze_detailed_breakdown(tmp_path) -> None:
+    output_path = tmp_path / "fakeout_full.csv"
+    result = runner.invoke(
+        app,
+        [
+            "analyze",
+            "--detail-level",
+            "full",
+            "--by-surprise",
+            "--output",
+            str(output_path),
+            "--cpi-data",
+            "sample",
+            "--btc-data",
+            "sample",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert output_path.exists()
+    assert "Fake move timing statistics" in result.stdout
+    assert "Breakdown by surprise type" in result.stdout
+    assert "Correlation between surprise magnitude and fake-out probability" in result.stdout
