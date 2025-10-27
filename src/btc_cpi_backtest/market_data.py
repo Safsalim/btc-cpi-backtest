@@ -115,7 +115,15 @@ class CandleFetcher:
         cache_path = self._cache_path(start, end)
         if cache_path.exists():
             df = pd.read_csv(cache_path)
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            if df.empty:
+                df["timestamp"] = pd.Series(dtype="datetime64[ns, UTC]")
+                for column in ["open", "high", "low", "close", "volume"]:
+                    df[column] = pd.Series(dtype="float64")
+            else:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                df[["open", "high", "low", "close", "volume"]] = df[
+                    ["open", "high", "low", "close", "volume"]
+                ].astype(float)
             LOGGER.debug("Loaded %s candles from cache %s", len(df), cache_path)
             return df, False, cache_path
 
