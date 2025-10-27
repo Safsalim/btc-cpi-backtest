@@ -57,8 +57,8 @@ loading/analysis helpers so you can experiment quickly or plug in your own data 
 
    > **Important dependency pinning**
    >
-   > - The current code uses `pydantic.BaseSettings`, which lives in **Pydantic 1.x**. Install
-   >   `pydantic<2` if your environment pulls in Pydantic 2 by default.
+   > - Settings management relies on [`pydantic-settings`](https://docs.pydantic.dev/latest/concepts/pydantic_settings/).
+   >   Installing the project pulls in compatible versions of both `pydantic` and `pydantic-settings`.
    > - Some versions of Typer/Click do not yet support `typing.Sequence` options. If you encounter the
    >   error `RuntimeError: Type not yet supported: typing.Sequence[str]`, see the
    >   [Troubleshooting](#troubleshooting--tips) section for workarounds.
