@@ -221,10 +221,14 @@ Key options:
 | `--evaluation-window`     | defaults: `1h`, `2h`, `4h`  | Override evaluation windows; same format as reaction windows.                                                 |
 | `--output/-o`             | `data/fakeout_analysis.csv` | Destination for the per-release report.                                                                       |
 | `--output-format/-f`      | `csv`                       | `csv` or `json`.                                                                                              |
+| `--html-output`           | `data/analysis_dashboard.html` | Path for the interactive HTML dashboard (`none` to skip generation).                                           |
+| `--open-html/--no-open-html` | `--no-open-html`          | Automatically open the generated dashboard in the default browser.                                            |
 | `--plot/--no-plot`        | `False`                     | Generate a Matplotlib line plot of evaluation window returns (requires visualization extras).                 |
 
 By default the command reads from `btcusd_1-min_data.csv` (minute-level BTC candles stored under `data/btcusd_1-min_data.csv`) and `data/cpi_releases.csv`.
 Use `--cpi-data sample --btc-data sample` to run against the lightweight bundled datasets.
+The `analyze` command also writes an interactive Plotly dashboard to `data/analysis_dashboard.html` unless you pass
+`--html-output none`; add `--open-html` to launch it in your browser automatically once generation completes.
 Ensure the price series spans the requested lookback and evaluation windows; if coverage is incomplete the CLI logs
 warnings and affected returns are reported as missing rather than aborting the run.
 
@@ -281,6 +285,9 @@ Correlation with CPI surprise:
   4h: -0.938
 Saved detailed report to data/fakeout_analysis.csv
 ```
+
+The CLI also writes an offline Plotly dashboard to `data/analysis_dashboard.html` (unless disabled) with interactive charts,
+filters, and per-release drilldowns that mirror the metrics above.
 
 The CSV (or JSON) report contains per-release metrics such as base price, returns for each window, and boolean
 flags that indicate whether the move qualifies as a fake-out (`fake_15m_4h`, etc.).
