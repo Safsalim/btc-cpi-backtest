@@ -14,6 +14,7 @@ import typer
 
 from .analysis import FakeoutConfig, FakeoutStats, FakeoutSummary, analyze_fakeouts
 from .cpi_loader import CPIColumnConfig, CPIRelease, load_cpi_from_csv, load_sample_cpi_data
+from .dashboard import DEFAULT_DASHBOARD_PATH, render_dashboard_html
 from .logging_config import configure_logging
 from .price_loader import load_price_series_from_csv, load_sample_price_series
 from .settings import Settings, get_settings
@@ -45,6 +46,13 @@ def _normalize_timezone_option(value: str) -> Optional[str]:
     if not normalized or normalized.lower() == "none":
         return None
     return normalized
+
+
+def _normalize_html_output_option(value: str) -> Optional[Path]:
+    normalized = value.strip()
+    if not normalized or normalized.lower() == "none":
+        return None
+    return Path(normalized).expanduser()
 
 
 def _parse_window_expression(value: str) -> tuple[str, timedelta]:
@@ -548,6 +556,18 @@ def analyze(
         help="Format for the detailed report (csv or json).",
         show_default=True,
     ),
+    html_output: str = typer.Option(
+        str(DEFAULT_DASHBOARD_PATH),
+        "--html-output",
+        help="Write interactive HTML dashboard to this path ('none' to skip).",
+        show_default=True,
+    ),
+    open_html: bool = typer.Option(
+        False,
+        "--open-html/--no-open-html",
+        help="Open the generated HTML dashboard in a browser.",
+        show_default=False,
+    ),
     plot: bool = typer.Option(
         False,
         "--plot/--no-plot",
@@ -673,6 +693,29 @@ def analyze(
 
     _export_report(result.events, output, fmt)
     typer.echo(f"Saved detailed report to {output.resolve()}")
+
+    html_output_path = _normalize_html_output_option(html_output)
+    if html_output_path is None:
+        if open_html:
+            typer.echo("HTML dashboard generation disabled; ignoring --open-html flag.")
+    else:
+        try:
+            destination = render_dashboard_html(
+                result=result,
+                releases=releases,
+                price_series=price_series,
+                config=analysis_config,
+                output_path=html_output_path,
+                open_browser=open_html,
+            )
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise typer.BadParameter(
+                "Plotly is required to generate the HTML dashboard. Install with 'pip install plotly'."
+            ) from exc
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        else:
+            typer.echo(f"Saved interactive dashboard to {destination.resolve()}")
 
     if plot:
         _render_plot(result.events, analysis_config)
