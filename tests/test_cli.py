@@ -42,9 +42,9 @@ def test_analyze_generates_report(tmp_path) -> None:
             "analyze",
             "--output",
             str(output_path),
-            "--cpi-source",
+            "--cpi-data",
             "sample",
-            "--price-source",
+            "--btc-data",
             "sample",
         ],
     )

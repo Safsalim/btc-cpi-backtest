@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import timezone, tzinfo
 from pathlib import Path
 
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 __all__ = [
@@ -25,6 +27,30 @@ def _resolve_timezone(value: str | tzinfo | None) -> tzinfo | None:
         raise ValueError(f"Unknown timezone: {value}") from exc
 
 
+def _resolve_column_name(df: pd.DataFrame, candidates: Sequence[str | None]) -> str:
+    available = {column.lower(): column for column in df.columns}
+    seen: set[str] = set()
+    display_candidates: list[str] = []
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        normalized = candidate.strip()
+        if not normalized:
+            continue
+        lower = normalized.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        display_candidates.append(normalized)
+        if lower in available:
+            return available[lower]
+
+    formatted = ", ".join(display_candidates) if display_candidates else "no candidates provided"
+    raise ValueError(
+        f"Missing required column(s) in price data. Expected one of: {formatted}"
+    )
+
+
 def load_price_series_from_csv(
     csv_path: str | Path,
     *,
@@ -42,12 +68,47 @@ def load_price_series_from_csv(
     if df.empty:
         raise ValueError(f"Price dataset {path} is empty")
 
-    missing = [col for col in (timestamp_column, close_column) if col not in df.columns]
-    if missing:
-        missing_list = ", ".join(missing)
-        raise ValueError(f"Missing required column(s) in price data: {missing_list}")
+    timestamp_candidates: tuple[str | None, ...] = (
+        timestamp_column,
+        "timestamp",
+        "Timestamp",
+        "time",
+        "Time",
+        "date",
+        "Date",
+        "datetime",
+        "Datetime",
+    )
+    timestamp_column_name = _resolve_column_name(df, timestamp_candidates)
 
-    timestamp_series = pd.to_datetime(df[timestamp_column], errors="coerce", utc=False)
+    close_candidates: tuple[str | None, ...] = (
+        close_column,
+        "close",
+        "Close",
+        "closing_price",
+        "Closing Price",
+    )
+    close_column_name = _resolve_column_name(df, close_candidates)
+
+    timestamp_raw = df[timestamp_column_name]
+    if is_numeric_dtype(timestamp_raw):
+        timestamp_values = pd.to_datetime(timestamp_raw, unit="s", errors="coerce", utc=True)
+    else:
+        numeric_timestamp = pd.to_numeric(timestamp_raw, errors="coerce")
+        if numeric_timestamp.notna().all():
+            timestamp_values = pd.to_datetime(
+                numeric_timestamp,
+                unit="s",
+                errors="coerce",
+                utc=True,
+            )
+        else:
+            timestamp_values = pd.to_datetime(timestamp_raw, errors="coerce", utc=False)
+
+    if isinstance(timestamp_values, pd.Series):
+        timestamp_series = timestamp_values.copy()
+    else:
+        timestamp_series = pd.Series(timestamp_values, index=df.index)
     if timestamp_series.isna().any():
         raise ValueError("Invalid or missing timestamps detected in price dataset")
 
@@ -60,14 +121,14 @@ def load_price_series_from_csv(
 
     timestamp_series = timestamp_series.dt.tz_convert(timezone.utc)
 
-    close_series = pd.to_numeric(df[close_column], errors="coerce")
+    close_series = pd.to_numeric(df[close_column_name], errors="coerce")
     if close_series.isna().any():
         raise ValueError("Close prices must be numeric")
 
     result = pd.Series(close_series.to_numpy(), index=timestamp_series)
     result = result.sort_index()
     result = result[~result.index.duplicated(keep="last")]
-    result.name = close_column
+    result.name = close_column_name
     return result
 
 
