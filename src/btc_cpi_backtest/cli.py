@@ -7,7 +7,7 @@ import math
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 import pandas as pd
 import typer
@@ -79,7 +79,7 @@ def _parse_window_expression(value: str) -> tuple[str, timedelta]:
 
 def _coerce_windows(
     defaults: Sequence[tuple[str, timedelta]],
-    overrides: Sequence[str],
+    overrides: List[str],
 ) -> tuple[tuple[str, timedelta], ...]:
     if not overrides:
         return tuple(defaults)
@@ -456,12 +456,12 @@ def analyze(
         help="Timezone for naive price timestamps (use 'none' to leave unspecified).",
         show_default=True,
     ),
-    reaction_window: Sequence[str] = typer.Option(
+    reaction_window: List[str] = typer.Option(
         [],
         "--reaction-window",
         help="Override reaction window durations (e.g., '--reaction-window 10m').",
     ),
-    evaluation_window: Sequence[str] = typer.Option(
+    evaluation_window: List[str] = typer.Option(
         [],
         "--evaluation-window",
         help="Override evaluation window durations (e.g., '--evaluation-window 90m').",
