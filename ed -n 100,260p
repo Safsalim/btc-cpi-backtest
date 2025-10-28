@@ -1,0 +1,154 @@
+[1mdiff --git a/src/btc_cpi_backtest/dashboard.py b/src/btc_cpi_backtest/dashboard.py[m
+[1mindex 021cf59..db0c1a0 100644[m
+[1m--- a/src/btc_cpi_backtest/dashboard.py[m
+[1m+++ b/src/btc_cpi_backtest/dashboard.py[m
+[36m@@ -2,6 +2,7 @@[m [mfrom __future__ import annotations[m
+ [m
+ import html[m
+ import json[m
+[32m+[m[32mimport logging[m
+ import math[m
+ import re[m
+ from datetime import timedelta[m
+[36m@@ -15,13 +16,15 @@[m [mimport plotly.graph_objects as go[m
+ from plotly import io as pio[m
+ from plotly.subplots import make_subplots[m
+ [m
+[31m-from .analysis import FakeoutAnalysisResult, FakeoutConfig[m
+[32m+[m[32mfrom .analysis import FakeoutAnalysisResult, FakeoutConfig, _classify_fakeout[m
+ from .cpi_loader import CPIRelease[m
+ [m
+ DEFAULT_DASHBOARD_PATH = Path("data") / "analysis_dashboard.html"[m
+ [m
+ __all__ = ["DEFAULT_DASHBOARD_PATH", "render_dashboard_html"][m
+ [m
+[32m+[m[32mlogger = logging.getLogger(__name__)[m
+[32m+[m
+ [m
+ def _aggregate_flags(values: Iterable[Any]) -> bool | None:[m
+     has_false = False[m
+[36m@@ -66,6 +69,33 @@[m [mdef _clean_numeric(value: Any) -> float | None:[m
+     return numeric[m
+ [m
+ [m
+[32m+[m[32mdef _price_at(series: pd.Series, timestamp: pd.Timestamp | None) -> float | None:[m
+[32m+[m[32m    if timestamp is None:[m
+[32m+[m[32m        return None[m
+[32m+[m
+[32m+[m[32m    ts = pd.Timestamp(timestamp)[m
+[32m+[m[32m    index_tz = getattr(series.index, "tz", None)[m
+[32m+[m
+[32m+[m[32m    if ts.tzinfo is None:[m
+[32m+[m[32m        if index_tz is not None:[m
+[32m+[m[32m            ts = ts.tz_localize(index_tz)[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        if index_tz is not None:[m
+[32m+[m[32m            ts = ts.tz_convert(index_tz)[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            ts = ts.tz_localize(None)[m
+[32m+[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        value = series.asof(ts)[m
+[32m+[m[32m    except AttributeError:  # pragma: no cover - for older pandas versions[m
+[32m+[m[32m        filtered = series.loc[:ts][m
+[32m+[m[32m        value = filtered.iloc[-1] if not filtered.empty else math.nan[m
+[32m+[m
+[32m+[m[32m    if value is None or (isinstance(value, float) and math.isnan(value)):[m
+[32m+[m[32m        return None[m
+[32m+[m[32m    return float(value)[m
+[32m+[m
+[32m+[m
+ class DashboardBuilder:[m
+     """Constructs an interactive Plotly dashboard for fake-out analysis."""[m
+ [m
+[36m@@ -130,19 +160,123 @@[m [mclass DashboardBuilder:[m
+         events = self._events[m
+         if not events.empty:[m
+             events = events.copy()[m
+[31m-        # Ensure release datetime is timezone-aware and sorted[m
+[32m+[m
+         if "release_datetime" in events.columns:[m
+             events["release_datetime"] = pd.to_datetime(events["release_datetime"], utc=True)[m
+             events.sort_values("release_datetime", inplace=True)[m
+             events.reset_index(drop=True, inplace=True)[m
+ [m
+[31m-        # compute percent columns for returns[m
+[32m+[m[32m        price_series = self._price_series[m
+[32m+[m[32m        if not price_series.empty:[m
+[32m+[m[32m            price_series = price_series.sort_index()[m
+[32m+[m[32m            price_series = price_series[~price_series.index.duplicated(keep="last")][m
+[32m+[m[32m        self._price_series = price_series[m
+[32m+[m
+[32m+[m[32m        if "cpi_surprise" in events.columns:[m
+[32m+[m[32m            events["cpi_surprise"] = pd.to_numeric(events["cpi_surprise"], errors="coerce")[m
+[32m+[m[32m        else:[m
+[32m+[m[32m            events["cpi_surprise"] = pd.Series([m
+[32m+[m[32m                [math.nan] * len(events),[m
+[32m+[m[32m                index=events.index,[m
+[32m+[m[32m                dtype="float64",[m
+[32m+[m[32m            )[m
+[32m+[m
+[32m+[m[32m        if "cpi_actual" in events.columns and "cpi_expected" in events.columns:[m
+[32m+[m[32m            actual_series = pd.to_numeric(events["cpi_actual"], errors="coerce")[m
+[32m+[m[32m            expected_series = pd.to_numeric(events["cpi_expected"], errors="coerce")[m
+[32m+[m[32m            fallback_surprise = actual_series - expected_series[m
+[32m+[m[32m            missing_mask = events["cpi_surprise"].isna()[m
+[32m+[m[32m            if missing_mask.all() and len(events) > 0:[m
+[32m+[m[32m                events["cpi_surprise"] = fallback_surprise[m
+[32m+[m[32m                logger.debug([m
+[32m+[m[32m                    "Filled CPI surprise for all %d releases using actual minus expected values",[m
+[32m+[m[32m                    len(events),[m
+[32m+[m[32m                )[m
+[32m+[m[32m            elif missing_mask.any():[m
+[32m+[m[32m                events.loc[missing_mask, "cpi_surprise"] = fallback_surprise.loc[missing_mask][m
+[32m+[m[32m                logger.debug([m
+[32m+[m[32m                    "Filled CPI surprise for %d releases using actual minus expected values",[m
+[32m+[m[32m                    int(missing_mask.sum()),[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m        if "base_price" not in events.columns:[m
+[32m+[m[32m            events["base_price"] = np.nan[m
+[32m+[m
+[32m+[m[32m        combined_windows = self._reaction_windows + self._evaluation_windows[m
+[32m+[m[32m        for label, _ in combined_windows:[m
+[32m+[m[32m            column_name = f"return_{label}"[m
+[32m+[m[32m            if column_name not in events.columns:[m
+[32m+[m[32m                events[column_name] = np.nan[m
+[32m+[m
+[32m+[m[32m        tolerance = self._config.tolerance[m
+[32m+[m[32m        if not price_series.empty and "release_datetime" in events.columns:[m
+[32m+[m[32m            for idx in range(len(events)):[m
+[32m+[m[32m                release_dt = events.at[idx, "release_datetime"][m
+[32m+[m[32m                if pd.isna(release_dt):[m
+[32m+[m[32m                    continue[m
+[32m+[m[32m                release_dt = pd.Timestamp(release_dt)[m
+[32m+[m[32m                if release_dt.tzinfo is None:[m
+[32m+[m[32m                    release_dt = release_dt.tz_localize("UTC")[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    release_dt = release_dt.tz_convert("UTC")[m
+[32m+[m[32m                base_price = events.at[idx, "base_price"][m
+[32m+[m[32m                if pd.isna(base_price):[m
+[32m+[m[32m                    base_price = _price_at(price_series, release_dt)[m
+[32m+[m[32m                    if base_price is None:[m
+[32m+[m[32m                        logger.debug("Missing base price for release at %s; skipping price backfill", release_dt)[m
+[32m+[m[32m                        continue[m
+[32m+[m[32m                    events.at[idx, "base_price"] = base_price[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    base_price = float(base_price)[m
+[32m+[m[32m                if base_price is None or base_price == 0.0:[m
+[32m+[m[32m                    continue[m
+[32m+[m[32m                for label, delta in combined_windows:[m
+[32m+[m[32m                    column_name = f"return_{label}"[m
+[32m+[m[32m                    value = events.at[idx, column_name][m
+[32m+[m[32m                    if pd.isna(value):[m
+[32m+[m[32m                        end_price = _price_at(price_series, release_dt + delta)[m
+[32m+[m[32m                        if end_price is None:[m
+[32m+[m[32m                            continue[m
+[32m+[m[32m                        events.at[idx, column_name] = (end_price / base_price) - 1.0[m
+[32m+[m
+[32m+[m[32m        for reaction_label in self._reaction_labels:[m
+[32m+[m[32m            for evaluation_label in self._evaluation_labels:[m
+[32m+[m[32m                fake_column = f"fake_{reaction_label}_{evaluation_label}"[m
+[32m+[m[32m                if fake_column in events.columns:[m
+[32m+[m[32m                    events[fake_column] = events[fake_column].astype("boolean")[m
+[32m+[

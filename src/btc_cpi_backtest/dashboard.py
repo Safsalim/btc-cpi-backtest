@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import math
 import re
 from datetime import timedelta
@@ -15,12 +16,14 @@ import plotly.graph_objects as go
 from plotly import io as pio
 from plotly.subplots import make_subplots
 
-from .analysis import FakeoutAnalysisResult, FakeoutConfig
+from .analysis import FakeoutAnalysisResult, FakeoutConfig, _classify_fakeout
 from .cpi_loader import CPIRelease
 
 DEFAULT_DASHBOARD_PATH = Path("data") / "analysis_dashboard.html"
 
 __all__ = ["DEFAULT_DASHBOARD_PATH", "render_dashboard_html"]
+
+logger = logging.getLogger(__name__)
 
 
 def _aggregate_flags(values: Iterable[Any]) -> bool | None:
@@ -64,6 +67,33 @@ def _clean_numeric(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return numeric
+
+
+def _price_at(series: pd.Series, timestamp: pd.Timestamp | None) -> float | None:
+    if timestamp is None:
+        return None
+
+    ts = pd.Timestamp(timestamp)
+    index_tz = getattr(series.index, "tz", None)
+
+    if ts.tzinfo is None:
+        if index_tz is not None:
+            ts = ts.tz_localize(index_tz)
+    else:
+        if index_tz is not None:
+            ts = ts.tz_convert(index_tz)
+        else:
+            ts = ts.tz_localize(None)
+
+    try:
+        value = series.asof(ts)
+    except AttributeError:  # pragma: no cover - for older pandas versions
+        filtered = series.loc[:ts]
+        value = filtered.iloc[-1] if not filtered.empty else math.nan
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return float(value)
 
 
 class DashboardBuilder:
@@ -130,19 +160,123 @@ class DashboardBuilder:
         events = self._events
         if not events.empty:
             events = events.copy()
-        # Ensure release datetime is timezone-aware and sorted
+
         if "release_datetime" in events.columns:
             events["release_datetime"] = pd.to_datetime(events["release_datetime"], utc=True)
             events.sort_values("release_datetime", inplace=True)
             events.reset_index(drop=True, inplace=True)
 
-        # compute percent columns for returns
-        for label in self._reaction_labels + self._evaluation_labels:
-            col = f"return_{label}"
-            if col in events.columns:
-                events[f"return_{label}_pct"] = events[col] * 100.0
+        price_series = self._price_series
+        if not price_series.empty:
+            price_series = price_series.sort_index()
+            price_series = price_series[~price_series.index.duplicated(keep="last")]
+        self._price_series = price_series
 
-        # map of fake columns for each combination
+        if "cpi_surprise" in events.columns:
+            events["cpi_surprise"] = pd.to_numeric(events["cpi_surprise"], errors="coerce")
+        else:
+            events["cpi_surprise"] = pd.Series(
+                [math.nan] * len(events),
+                index=events.index,
+                dtype="float64",
+            )
+
+        if "cpi_actual" in events.columns and "cpi_expected" in events.columns:
+            actual_series = pd.to_numeric(events["cpi_actual"], errors="coerce")
+            expected_series = pd.to_numeric(events["cpi_expected"], errors="coerce")
+            fallback_surprise = actual_series - expected_series
+            missing_mask = events["cpi_surprise"].isna()
+            if missing_mask.all() and len(events) > 0:
+                events["cpi_surprise"] = fallback_surprise
+                logger.debug(
+                    "Filled CPI surprise for all %d releases using actual minus expected values",
+                    len(events),
+                )
+            elif missing_mask.any():
+                events.loc[missing_mask, "cpi_surprise"] = fallback_surprise.loc[missing_mask]
+                logger.debug(
+                    "Filled CPI surprise for %d releases using actual minus expected values",
+                    int(missing_mask.sum()),
+                )
+
+        if "base_price" not in events.columns:
+            events["base_price"] = np.nan
+
+        combined_windows = self._reaction_windows + self._evaluation_windows
+        for label, _ in combined_windows:
+            column_name = f"return_{label}"
+            if column_name not in events.columns:
+                events[column_name] = np.nan
+
+        tolerance = self._config.tolerance
+        if not price_series.empty and "release_datetime" in events.columns:
+            for idx in range(len(events)):
+                release_dt = events.at[idx, "release_datetime"]
+                if pd.isna(release_dt):
+                    continue
+                release_dt = pd.Timestamp(release_dt)
+                if release_dt.tzinfo is None:
+                    release_dt = release_dt.tz_localize("UTC")
+                else:
+                    release_dt = release_dt.tz_convert("UTC")
+                base_price = events.at[idx, "base_price"]
+                if pd.isna(base_price):
+                    base_price = _price_at(price_series, release_dt)
+                    if base_price is None:
+                        logger.debug("Missing base price for release at %s; skipping price backfill", release_dt)
+                        continue
+                    events.at[idx, "base_price"] = base_price
+                else:
+                    base_price = float(base_price)
+                if base_price is None or base_price == 0.0:
+                    continue
+                for label, delta in combined_windows:
+                    column_name = f"return_{label}"
+                    value = events.at[idx, column_name]
+                    if pd.isna(value):
+                        end_price = _price_at(price_series, release_dt + delta)
+                        if end_price is None:
+                            continue
+                        events.at[idx, column_name] = (end_price / base_price) - 1.0
+
+        for reaction_label in self._reaction_labels:
+            for evaluation_label in self._evaluation_labels:
+                fake_column = f"fake_{reaction_label}_{evaluation_label}"
+                if fake_column in events.columns:
+                    events[fake_column] = events[fake_column].astype("boolean")
+                else:
+                    events[fake_column] = pd.Series(
+                        [pd.NA] * len(events),
+                        index=events.index,
+                        dtype="boolean",
+                    )
+
+        if combined_windows and not events.empty:
+            for idx in range(len(events)):
+                for reaction_label in self._reaction_labels:
+                    reaction_column = f"return_{reaction_label}"
+                    reaction_value = events.at[idx, reaction_column]
+                    if pd.isna(reaction_value):
+                        continue
+                    for evaluation_label in self._evaluation_labels:
+                        evaluation_column = f"return_{evaluation_label}"
+                        evaluation_value = events.at[idx, evaluation_column]
+                        if pd.isna(evaluation_value):
+                            continue
+                        fake_column = f"fake_{reaction_label}_{evaluation_label}"
+                        if pd.isna(events.at[idx, fake_column]):
+                            events.at[idx, fake_column] = _classify_fakeout(
+                                float(reaction_value),
+                                float(evaluation_value),
+                                tolerance=tolerance,
+                            )
+
+        for label in self._reaction_labels + self._evaluation_labels:
+            base_column = f"return_{label}"
+            pct_column = f"return_{label}_pct"
+            if base_column in events.columns:
+                events[pct_column] = events[base_column] * 100.0
+
         fake_column_map: dict[tuple[str, str], str] = {}
         for reaction_label in self._reaction_labels:
             for evaluation_label in self._evaluation_labels:
@@ -150,7 +284,6 @@ class DashboardBuilder:
                 if column_name in events.columns:
                     fake_column_map[(reaction_label, evaluation_label)] = column_name
 
-        # aggregated flags by evaluation window
         for evaluation_label in self._evaluation_labels:
             columns = [
                 fake_column_map[(reaction_label, evaluation_label)]
@@ -165,7 +298,6 @@ class DashboardBuilder:
                 index=events.index,
             )
 
-        # aggregated flags by reaction window
         for reaction_label in self._reaction_labels:
             columns = [
                 fake_column_map[(reaction_label, evaluation_label)]
@@ -187,30 +319,75 @@ class DashboardBuilder:
                 pd.array(aggregated, dtype="boolean"),
                 index=events.index,
             )
+        else:
+            events["fake_any"] = pd.Series(
+                pd.array([pd.NA] * len(events), dtype="boolean"),
+                index=events.index,
+            )
 
-        # compute fake move duration (minutes until reversal)
-        evaluation_minutes = {
-            label: _timedelta_minutes(delta) for label, delta in self._evaluation_windows
-        }
         durations: list[int | None] = []
-        for idx, row in events.iterrows():
-            minutes_candidates: list[int] = []
-            for evaluation_label in self._evaluation_labels:
-                minute_value = evaluation_minutes.get(evaluation_label)
-                if minute_value is None:
+        if not price_series.empty and "release_datetime" in events.columns:
+            max_eval_delta = max((delta for _, delta in self._evaluation_windows), default=timedelta(0))
+            search_delta = max(self._price_window_after, max_eval_delta)
+            for idx in range(len(events)):
+                fake_any_value = events.at[idx, "fake_any"]
+                if pd.isna(fake_any_value) or not bool(fake_any_value):
+                    durations.append(None)
                     continue
+                release_dt = events.at[idx, "release_datetime"]
+                if pd.isna(release_dt):
+                    durations.append(None)
+                    continue
+                release_dt = pd.Timestamp(release_dt)
+                if release_dt.tzinfo is None:
+                    release_dt = release_dt.tz_localize("UTC")
+                else:
+                    release_dt = release_dt.tz_convert("UTC")
+                base_price = events.at[idx, "base_price"]
+                if pd.isna(base_price):
+                    durations.append(None)
+                    continue
+                base_price = float(base_price)
+                initial_return = None
                 for reaction_label in self._reaction_labels:
-                    column_name = fake_column_map.get((reaction_label, evaluation_label))
-                    if column_name is None:
+                    reaction_value = events.at[idx, f"return_{reaction_label}"]
+                    if pd.isna(reaction_value):
                         continue
-                    value = row.get(column_name)
-                    if value is True:
-                        minutes_candidates.append(minute_value)
-            durations.append(min(minutes_candidates) if minutes_candidates else None)
+                    if abs(float(reaction_value)) <= tolerance:
+                        continue
+                    initial_return = float(reaction_value)
+                    break
+                if initial_return is None:
+                    durations.append(None)
+                    continue
+                window_end = release_dt + search_delta
+                window_slice = price_series.loc[release_dt:window_end]
+                window_slice = window_slice[window_slice.index > release_dt]
+                if window_slice.empty:
+                    durations.append(None)
+                    continue
+                relative_returns = (window_slice / base_price) - 1.0
+                if initial_return > 0:
+                    reversal_points = relative_returns[relative_returns <= 0]
+                else:
+                    reversal_points = relative_returns[relative_returns >= 0]
+                if reversal_points.empty:
+                    durations.append(None)
+                    continue
+                reversal_ts = reversal_points.index[0]
+                minutes = max(0, _timedelta_minutes(reversal_ts - release_dt))
+                durations.append(minutes)
         if durations:
-            events["fake_duration_minutes"] = pd.Series(durations, index=events.index)
+            duration_series = pd.Series(durations, index=events.index, dtype="Float64")
+            events["fake_duration_minutes"] = duration_series
+            logger.debug(
+                "Computed price-based fake durations for %d of %d releases",
+                int(duration_series.notna().sum()),
+                len(events),
+            )
+        else:
+            events["fake_duration_minutes"] = pd.Series(dtype="Float64")
 
-        # categorize surprises
         events["surprise_type"] = events["cpi_surprise"].apply(
             lambda value: _categorize_surprise(value, neutral_band=self._neutral_surprise_band)
         )
@@ -384,6 +561,8 @@ class DashboardBuilder:
 
         # Distribution of CPI surprises
         if not events["cpi_surprise"].dropna().empty:
+            surprise_count = int(events["cpi_surprise"].dropna().size)
+            logger.debug("Building CPI surprise distribution with %d samples", surprise_count)
             nbins = min(30, max(10, int(math.sqrt(len(events)))))
             surprise_hist = px.histogram(
                 events,
@@ -402,6 +581,10 @@ class DashboardBuilder:
             reaction_column = f"return_{self._primary_reaction}_pct"
             scatter_df = events.dropna(subset=["cpi_surprise", reaction_column])
             if not scatter_df.empty:
+                logger.debug(
+                    "Building reaction vs surprise chart with %d points",
+                    len(scatter_df),
+                )
                 scatter_fig = px.scatter(
                     scatter_df,
                     x="cpi_surprise",
@@ -454,6 +637,10 @@ class DashboardBuilder:
                         .dropna()
                     )
                     if not grouped.empty:
+                        logger.debug(
+                            "Building fake probability vs surprise chart with %d bins",
+                            len(grouped),
+                        )
                         grouped["fake_rate_pct"] = grouped["fake_rate"] * 100.0
                         fake_prob_fig = px.scatter(
                             grouped,
@@ -473,6 +660,10 @@ class DashboardBuilder:
         if "fake_duration_minutes" in events.columns:
             duration_df = events.dropna(subset=["fake_duration_minutes"])
             if not duration_df.empty:
+                logger.debug(
+                    "Building fake duration chart with %d samples",
+                    len(duration_df),
+                )
                 subplot_fig = make_subplots(rows=1, cols=2, subplot_titles=("Histogram", "Box plot"))
                 histogram = go.Histogram(
                     x=duration_df["fake_duration_minutes"],
@@ -551,6 +742,10 @@ class DashboardBuilder:
             if not trajectory_df.empty:
                 trajectory_summary = (
                     trajectory_df.groupby(["category", "minutes", "label"], as_index=False)["return_pct"].mean()
+                )
+                logger.debug(
+                    "Building price trajectory chart with %d aggregated points",
+                    len(trajectory_summary),
                 )
                 trajectory_fig = px.line(
                     trajectory_summary,
