@@ -7,7 +7,7 @@ import math
 import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Literal, Sequence
+from typing import Any, Callable, Dict, Iterable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -136,6 +136,7 @@ class DashboardBuilder:
 
         self._processed = False
         self._figures: Dict[str, dict[str, Any]] = {}
+        self._figure_messages: Dict[str, str] = {}
         self._table_rows: list[dict[str, Any]] = []
         self._price_windows: dict[int, dict[str, Any]] = {}
         self._summary_cards: list[dict[str, str]] = []
@@ -158,6 +159,7 @@ class DashboardBuilder:
 
     def _prepare_events(self) -> None:
         events = self._events
+        logger.debug("Preparing dashboard events dataset with %d rows", len(events))
         if not events.empty:
             events = events.copy()
 
@@ -171,6 +173,11 @@ class DashboardBuilder:
             price_series = price_series.sort_index()
             price_series = price_series[~price_series.index.duplicated(keep="last")]
         self._price_series = price_series
+        logger.debug(
+            "Price series prepared with %d points (tz=%s)",
+            len(price_series),
+            getattr(price_series.index, "tz", None),
+        )
 
         if "cpi_surprise" in events.columns:
             events["cpi_surprise"] = pd.to_numeric(events["cpi_surprise"], errors="coerce")
@@ -325,68 +332,81 @@ class DashboardBuilder:
                 index=events.index,
             )
 
-        durations: list[int | None] = []
-        if not price_series.empty and "release_datetime" in events.columns:
-            max_eval_delta = max((delta for _, delta in self._evaluation_windows), default=timedelta(0))
-            search_delta = max(self._price_window_after, max_eval_delta)
-            for idx in range(len(events)):
-                fake_any_value = events.at[idx, "fake_any"]
-                if pd.isna(fake_any_value) or not bool(fake_any_value):
-                    durations.append(None)
-                    continue
-                release_dt = events.at[idx, "release_datetime"]
-                if pd.isna(release_dt):
-                    durations.append(None)
-                    continue
-                release_dt = pd.Timestamp(release_dt)
-                if release_dt.tzinfo is None:
-                    release_dt = release_dt.tz_localize("UTC")
-                else:
-                    release_dt = release_dt.tz_convert("UTC")
-                base_price = events.at[idx, "base_price"]
-                if pd.isna(base_price):
-                    durations.append(None)
-                    continue
-                base_price = float(base_price)
-                initial_return = None
-                for reaction_label in self._reaction_labels:
-                    reaction_value = events.at[idx, f"return_{reaction_label}"]
-                    if pd.isna(reaction_value):
+        recompute_durations = (
+            "fake_duration_minutes" not in events.columns
+            or events["fake_duration_minutes"].dropna().empty
+        )
+        if recompute_durations:
+            logger.debug("Recomputing fake-out durations for %d releases", len(events))
+            durations: list[int | None] = []
+            if not price_series.empty and "release_datetime" in events.columns:
+                max_eval_delta = max((delta for _, delta in self._evaluation_windows), default=timedelta(0))
+                search_delta = max(self._price_window_after, max_eval_delta)
+                for idx in range(len(events)):
+                    fake_any_value = events.at[idx, "fake_any"]
+                    if pd.isna(fake_any_value) or not bool(fake_any_value):
+                        durations.append(None)
                         continue
-                    if abs(float(reaction_value)) <= tolerance:
+                    release_dt = events.at[idx, "release_datetime"]
+                    if pd.isna(release_dt):
+                        durations.append(None)
                         continue
-                    initial_return = float(reaction_value)
-                    break
-                if initial_return is None:
-                    durations.append(None)
-                    continue
-                window_end = release_dt + search_delta
-                window_slice = price_series.loc[release_dt:window_end]
-                window_slice = window_slice[window_slice.index > release_dt]
-                if window_slice.empty:
-                    durations.append(None)
-                    continue
-                relative_returns = (window_slice / base_price) - 1.0
-                if initial_return > 0:
-                    reversal_points = relative_returns[relative_returns <= 0]
-                else:
-                    reversal_points = relative_returns[relative_returns >= 0]
-                if reversal_points.empty:
-                    durations.append(None)
-                    continue
-                reversal_ts = reversal_points.index[0]
-                minutes = max(0, _timedelta_minutes(reversal_ts - release_dt))
-                durations.append(minutes)
-        if durations:
-            duration_series = pd.Series(durations, index=events.index, dtype="Float64")
-            events["fake_duration_minutes"] = duration_series
-            logger.debug(
-                "Computed price-based fake durations for %d of %d releases",
-                int(duration_series.notna().sum()),
-                len(events),
-            )
+                    release_dt = pd.Timestamp(release_dt)
+                    if release_dt.tzinfo is None:
+                        release_dt = release_dt.tz_localize("UTC")
+                    else:
+                        release_dt = release_dt.tz_convert("UTC")
+                    base_price = events.at[idx, "base_price"]
+                    if pd.isna(base_price):
+                        durations.append(None)
+                        continue
+                    base_price = float(base_price)
+                    initial_return = None
+                    for reaction_label in self._reaction_labels:
+                        reaction_value = events.at[idx, f"return_{reaction_label}"]
+                        if pd.isna(reaction_value):
+                            continue
+                        if abs(float(reaction_value)) <= tolerance:
+                            continue
+                        initial_return = float(reaction_value)
+                        break
+                    if initial_return is None:
+                        durations.append(None)
+                        continue
+                    window_end = release_dt + search_delta
+                    window_slice = price_series.loc[release_dt:window_end]
+                    window_slice = window_slice[window_slice.index > release_dt]
+                    if window_slice.empty:
+                        durations.append(None)
+                        continue
+                    relative_returns = (window_slice / base_price) - 1.0
+                    if initial_return > 0:
+                        reversal_points = relative_returns[relative_returns <= 0]
+                    else:
+                        reversal_points = relative_returns[relative_returns >= 0]
+                    if reversal_points.empty:
+                        durations.append(None)
+                        continue
+                    reversal_ts = reversal_points.index[0]
+                    minutes = max(0, _timedelta_minutes(reversal_ts - release_dt))
+                    durations.append(minutes)
+            if durations:
+                duration_series = pd.Series(durations, index=events.index, dtype="Float64")
+                events["fake_duration_minutes"] = duration_series
+                logger.debug(
+                    "Computed price-based fake durations for %d of %d releases",
+                    int(duration_series.notna().sum()),
+                    len(events),
+                )
+            else:
+                events["fake_duration_minutes"] = pd.Series(dtype="Float64")
+                logger.debug("No reversal durations could be derived from price history")
         else:
-            events["fake_duration_minutes"] = pd.Series(dtype="Float64")
+            existing = events["fake_duration_minutes"].dropna()
+            logger.debug(
+                "Using precomputed fake-out durations for %d releases",
+                int(existing.size),
+            )
 
         events["surprise_type"] = events["cpi_surprise"].apply(
             lambda value: _categorize_surprise(value, neutral_band=self._neutral_surprise_band)
@@ -457,312 +477,453 @@ class DashboardBuilder:
     def _build_figures(self) -> None:
         events = self._events
         figures: Dict[str, dict[str, Any]] = {}
+        messages: Dict[str, str] = {}
+
+        logger.debug("Building dashboard figures from %d events", len(events))
 
         if events.empty:
+            logger.debug("No events available; skipping chart generation")
             self._figures = figures
+            self._figure_messages = messages
             return
 
-        # Fake-out rates by evaluation window
-        fake_by_eval_records = []
-        for evaluation_label in self._evaluation_labels:
-            column = f"fake_by_evaluation_{evaluation_label}"
-            if column not in events.columns:
-                continue
-            valid = events[column].dropna()
-            rate = float(valid.mean()) if not valid.empty else math.nan
-            fake_by_eval_records.append({
-                "evaluation_label": evaluation_label,
-                "fake_rate": rate,
-                "count": int(valid.size),
-            })
-        if fake_by_eval_records:
-            fake_by_eval_df = pd.DataFrame(fake_by_eval_records)
-            fake_by_eval_df["fake_rate_pct"] = fake_by_eval_df["fake_rate"] * 100.0
-            fake_by_eval_df["label"] = fake_by_eval_df["fake_rate_pct"].apply(
+        def register(chart_id: str, builder: Callable[[], go.Figure | None], empty_message: str) -> None:
+            try:
+                figure = builder()
+            except Exception:
+                logger.exception("Failed to build chart '%s'", chart_id)
+                messages[chart_id] = "Unable to render chart due to an internal error."
+                return
+            if figure is None:
+                messages[chart_id] = empty_message
+                logger.debug("Chart '%s' unavailable: %s", chart_id, empty_message)
+                return
+            figures[chart_id] = self._serialize_figure(figure)
+
+        def build_fake_by_window() -> go.Figure | None:
+            records: list[dict[str, float]] = []
+            for evaluation_label in self._evaluation_labels:
+                column = f"fake_by_evaluation_{evaluation_label}"
+                if column not in events.columns:
+                    continue
+                valid = events[column].dropna()
+                if valid.empty:
+                    continue
+                records.append(
+                    {
+                        "evaluation_label": evaluation_label,
+                        "fake_rate": float(valid.mean()),
+                        "count": int(valid.size),
+                    }
+                )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            logger.debug(
+                "Fake-out by evaluation window chart using %d evaluation windows", len(df)
+            )
+            df["fake_rate_pct"] = df["fake_rate"] * 100.0
+            df["label"] = df["fake_rate_pct"].apply(
                 lambda value: "n/a" if pd.isna(value) else f"{value:.1f}%"
             )
-            fake_rate_fig = px.bar(
-                fake_by_eval_df,
+            fig = px.bar(
+                df,
                 x="evaluation_label",
                 y="fake_rate_pct",
                 text="label",
             )
-            fake_rate_fig.update_traces(textposition="outside")
-            fake_rate_fig.update_yaxes(title="Fake-out rate (%)")
-            fake_rate_fig.update_xaxes(title="Evaluation window")
-            fake_rate_fig.update_layout(title="Fake-out rates by evaluation window")
-            figures["fake_by_window"] = self._serialize_figure(fake_rate_fig)
+            fig.update_traces(textposition="outside")
+            fig.update_yaxes(title="Fake-out rate (%)")
+            fig.update_xaxes(title="Evaluation window")
+            fig.update_layout(title="Fake-out rates by evaluation window")
+            return fig
 
-        # Fake-out rates by surprise type (grouped)
-        grouped_records = []
-        for evaluation_label in self._evaluation_labels:
-            column = f"fake_by_evaluation_{evaluation_label}"
-            if column not in events.columns:
-                continue
-            for surprise_type, group in events.groupby("surprise_type", dropna=False):
-                valid = group[column].dropna()
-                if valid.empty:
+        def build_fake_by_surprise_type() -> go.Figure | None:
+            records: list[dict[str, float]] = []
+            for evaluation_label in self._evaluation_labels:
+                column = f"fake_by_evaluation_{evaluation_label}"
+                if column not in events.columns:
                     continue
-                grouped_records.append({
-                    "evaluation_label": evaluation_label,
-                    "surprise_type": surprise_type,
-                    "fake_rate": float(valid.mean()),
-                    "count": int(valid.size),
-                })
-        if grouped_records:
-            grouped_df = pd.DataFrame(grouped_records)
-            grouped_df["fake_rate_pct"] = grouped_df["fake_rate"] * 100.0
-            grouped_fig = px.bar(
-                grouped_df,
+                for surprise_type, group in events.groupby("surprise_type", dropna=False):
+                    valid = group[column].dropna()
+                    if valid.empty:
+                        continue
+                    records.append(
+                        {
+                            "evaluation_label": evaluation_label,
+                            "surprise_type": surprise_type,
+                            "fake_rate": float(valid.mean()),
+                            "count": int(valid.size),
+                        }
+                    )
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            logger.debug(
+                "Fake-out by surprise type chart using %d grouped rows", len(df)
+            )
+            df["fake_rate_pct"] = df["fake_rate"] * 100.0
+            fig = px.bar(
+                df,
                 x="surprise_type",
                 y="fake_rate_pct",
                 color="evaluation_label",
                 barmode="group",
             )
-            grouped_fig.update_yaxes(title="Fake-out rate (%)")
-            grouped_fig.update_xaxes(title="Surprise type")
-            grouped_fig.update_layout(title="Fake-out rates by surprise type")
-            figures["fake_by_surprise"] = self._serialize_figure(grouped_fig)
+            fig.update_yaxes(title="Fake-out rate (%)")
+            fig.update_xaxes(title="Surprise type")
+            fig.update_layout(title="Fake-out rates by surprise type")
+            return fig
 
-        # Timeline scatter of CPI releases
-        if self._primary_evaluation:
-            timeline_df = events.copy()
-            outcome_labels = []
+        def build_timeline() -> go.Figure | None:
+            if not self._primary_evaluation:
+                return None
             column = f"fake_by_evaluation_{self._primary_evaluation}"
-            for value in timeline_df.get(column, pd.Series(dtype="boolean")):
+            if column not in events.columns:
+                return None
+            timeline_df = events.copy()
+            values = timeline_df.get(column, pd.Series(dtype="boolean"))
+            outcome_labels = []
+            for value in values:
                 if pd.isna(value):
                     outcome_labels.append("Incomplete")
-                elif value:
+                elif bool(value):
                     outcome_labels.append("Fake-out")
                 else:
                     outcome_labels.append("Sustained")
             timeline_df["outcome"] = outcome_labels
             return_column = f"return_{self._primary_evaluation}_pct"
-            if return_column in timeline_df.columns:
-                timeline_fig = px.scatter(
-                    timeline_df,
-                    x="release_datetime",
-                    y=return_column,
-                    color="outcome",
-                    hover_data={
-                        "cpi_actual": True,
-                        "cpi_expected": True,
-                        "cpi_surprise": True,
-                        return_column: True,
-                    },
-                )
-                timeline_fig.update_traces(marker=dict(size=11), selector=dict(mode="markers"))
-                timeline_fig.update_layout(
-                    title=f"Timeline of CPI releases ({self._primary_evaluation} outcome)",
-                    yaxis_title=f"Return {self._primary_evaluation} (%)",
-                    xaxis_title="Release datetime",
-                )
-                figures["timeline"] = self._serialize_figure(timeline_fig)
+            if return_column not in timeline_df.columns:
+                return None
+            logger.debug(
+                "Timeline chart prepared with %d releases", len(timeline_df)
+            )
+            fig = px.scatter(
+                timeline_df,
+                x="release_datetime",
+                y=return_column,
+                color="outcome",
+                hover_data={
+                    "cpi_actual": True,
+                    "cpi_expected": True,
+                    "cpi_surprise": True,
+                    return_column: True,
+                },
+            )
+            fig.update_traces(marker=dict(size=11), selector=dict(mode="markers"))
+            fig.update_layout(
+                title=f"Timeline of CPI releases ({self._primary_evaluation} outcome)",
+                yaxis_title=f"Return {self._primary_evaluation} (%)",
+                xaxis_title="Release datetime",
+            )
+            return fig
 
-        # Distribution of CPI surprises
-        if not events["cpi_surprise"].dropna().empty:
-            surprise_count = int(events["cpi_surprise"].dropna().size)
-            logger.debug("Building CPI surprise distribution with %d samples", surprise_count)
-            nbins = min(30, max(10, int(math.sqrt(len(events)))))
-            surprise_hist = px.histogram(
+        def build_surprise_distribution() -> go.Figure | None:
+            surprises = events["cpi_surprise"].dropna()
+            if surprises.empty:
+                return None
+            sample_count = int(surprises.size)
+            logger.debug(
+                "CPI surprise distribution chart using %d samples", sample_count
+            )
+            nbins = min(30, max(10, int(math.sqrt(sample_count))))
+            fig = px.histogram(
                 events,
                 x="cpi_surprise",
                 nbins=nbins,
             )
-            surprise_hist.update_layout(
+            fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
+            fig.update_layout(
                 title="Distribution of CPI surprises",
                 xaxis_title="Surprise (actual - expected, %)",
                 yaxis_title="Count",
             )
-            figures["surprise_distribution"] = self._serialize_figure(surprise_hist)
+            return fig
 
-        # Price reaction vs surprise magnitude
-        if self._primary_reaction:
+        def build_reaction_vs_surprise() -> go.Figure | None:
+            if not self._primary_reaction:
+                return None
             reaction_column = f"return_{self._primary_reaction}_pct"
-            scatter_df = events.dropna(subset=["cpi_surprise", reaction_column])
-            if not scatter_df.empty:
-                logger.debug(
-                    "Building reaction vs surprise chart with %d points",
-                    len(scatter_df),
-                )
-                scatter_fig = px.scatter(
-                    scatter_df,
-                    x="cpi_surprise",
-                    y=reaction_column,
-                    hover_name="release_datetime",
-                )
-                if len(scatter_df) >= 2:
-                    x_vals = scatter_df["cpi_surprise"].to_numpy(float)
-                    y_vals = scatter_df[reaction_column].to_numpy(float)
-                    slope, intercept = np.polyfit(x_vals, y_vals, 1)
-                    x_range = np.linspace(x_vals.min(), x_vals.max(), 50)
-                    trendline = go.Scatter(
+            if reaction_column not in events.columns:
+                return None
+            df = events.dropna(subset=["cpi_surprise", reaction_column, "fake_any"])
+            if df.empty:
+                return None
+            df = df.copy()
+            df["outcome"] = np.where(df["fake_any"].astype(bool), "Fake move", "Sustained move")
+            logger.debug(
+                "Reaction vs surprise chart using %d samples (fake=%d, sustained=%d)",
+                len(df),
+                int((df["outcome"] == "Fake move").sum()),
+                int((df["outcome"] == "Sustained move").sum()),
+            )
+            fig = px.scatter(
+                df,
+                x="cpi_surprise",
+                y=reaction_column,
+                color="outcome",
+                hover_name="release_datetime",
+            )
+            if len(df) >= 2:
+                x_vals = df["cpi_surprise"].to_numpy(float)
+                y_vals = df[reaction_column].to_numpy(float)
+                slope, intercept = np.polyfit(x_vals, y_vals, 1)
+                x_range = np.linspace(x_vals.min(), x_vals.max(), 100)
+                fig.add_trace(
+                    go.Scatter(
                         x=x_range,
                         y=slope * x_range + intercept,
                         mode="lines",
                         name="Trendline",
                         line=dict(color="#EF553B", width=2),
                     )
-                    scatter_fig.add_trace(trendline)
-                scatter_fig.update_layout(
-                    title=f"Price reaction vs CPI surprise ({self._primary_reaction})",
-                    xaxis_title="CPI surprise (%)",
-                    yaxis_title=f"Return {self._primary_reaction} (%)",
                 )
-                figures["reaction_vs_surprise"] = self._serialize_figure(scatter_fig)
-
-        # Fake-out probability vs surprise magnitude
-        if self._primary_evaluation:
-            fake_column = f"fake_by_evaluation_{self._primary_evaluation}"
-            if fake_column in events.columns:
-                fake_df = events.dropna(subset=["cpi_surprise", fake_column])
-                if not fake_df.empty:
-                    surprise_values = fake_df["cpi_surprise"].to_numpy(float)
-                    unique_surprise = float(surprise_values.max() - surprise_values.min())
-                    if unique_surprise == 0:
-                        bins = np.array([surprise_values.min() - 0.5, surprise_values.max() + 0.5])
-                    else:
-                        bin_count = min(12, max(4, int(math.sqrt(len(fake_df)))))
-                        bins = np.linspace(surprise_values.min(), surprise_values.max(), bin_count + 1)
-                    fake_df = fake_df.assign(
-                        surprise_bin=pd.cut(fake_df["cpi_surprise"], bins=bins, include_lowest=True)
-                    )
-                    grouped = (
-                        fake_df.groupby("surprise_bin", observed=True)
-                        .agg(
-                            fake_rate=(fake_column, "mean"),
-                            sample_size=(fake_column, "size"),
-                            avg_surprise=("cpi_surprise", "mean"),
-                        )
-                        .dropna()
-                    )
-                    if not grouped.empty:
-                        logger.debug(
-                            "Building fake probability vs surprise chart with %d bins",
-                            len(grouped),
-                        )
-                        grouped["fake_rate_pct"] = grouped["fake_rate"] * 100.0
-                        fake_prob_fig = px.scatter(
-                            grouped,
-                            x="avg_surprise",
-                            y="fake_rate_pct",
-                            size="sample_size",
-                            hover_data={"sample_size": True},
-                        )
-                        fake_prob_fig.update_layout(
-                            title=f"Fake-out probability vs surprise ({self._primary_evaluation})",
-                            xaxis_title="Average surprise in bin (%)",
-                            yaxis_title="Fake-out rate (%)",
-                        )
-                        figures["fake_probability"] = self._serialize_figure(fake_prob_fig)
-
-        # Fake move duration distribution (histogram + box)
-        if "fake_duration_minutes" in events.columns:
-            duration_df = events.dropna(subset=["fake_duration_minutes"])
-            if not duration_df.empty:
-                logger.debug(
-                    "Building fake duration chart with %d samples",
-                    len(duration_df),
-                )
-                subplot_fig = make_subplots(rows=1, cols=2, subplot_titles=("Histogram", "Box plot"))
-                histogram = go.Histogram(
-                    x=duration_df["fake_duration_minutes"],
-                    nbinsx=min(20, max(5, int(len(duration_df) ** 0.5))),
-                    name="Duration",
-                    marker_color="#636EFA",
-                    opacity=0.75,
-                )
-                box = go.Box(
-                    x=duration_df["fake_duration_minutes"],
-                    name="",
-                    marker_color="#EF553B",
-                    boxmean=True,
-                    orientation="h",
-                )
-                subplot_fig.add_trace(histogram, row=1, col=1)
-                subplot_fig.add_trace(box, row=1, col=2)
-                subplot_fig.update_xaxes(title_text="Minutes", row=1, col=1)
-                subplot_fig.update_yaxes(title_text="Count", row=1, col=1)
-                subplot_fig.update_xaxes(title_text="Minutes", row=1, col=2)
-                subplot_fig.update_layout(title="Distribution of fake move durations", showlegend=False)
-                figures["fake_durations"] = self._serialize_figure(subplot_fig)
-
-            # Average reversal time by surprise type
-            grouped_duration = (
-                duration_df.groupby("surprise_type", dropna=False)["fake_duration_minutes"].mean()
+            fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+            fig.update_traces(marker=dict(size=10, opacity=0.85))
+            fig.update_layout(
+                title=f"Price reaction vs CPI surprise ({self._primary_reaction})",
+                xaxis_title="CPI surprise (%)",
+                yaxis_title=f"Return {self._primary_reaction} (%)",
             )
-            if not grouped_duration.empty:
-                duration_records = grouped_duration.reset_index(name="avg_minutes")
-                duration_records["avg_minutes"] = duration_records["avg_minutes"].astype(float)
-                duration_fig = px.bar(
-                    duration_records,
-                    x="surprise_type",
-                    y="avg_minutes",
-                )
-                duration_fig.update_layout(
-                    title="Average reversal time by surprise type",
-                    xaxis_title="Surprise type",
-                    yaxis_title="Average minutes",
-                )
-                figures["duration_by_surprise"] = self._serialize_figure(duration_fig)
+            return fig
 
-        # Price movement trajectories for fake vs sustained moves
-        time_records = []
-        combined_windows = []
-        for label, delta in self._reaction_windows + self._evaluation_windows:
-            combined_windows.append((label, delta))
-        seen_minutes: set[int] = set()
-        ordered_windows: list[tuple[str, timedelta]] = []
-        for label, delta in sorted(combined_windows, key=lambda item: item[1]):
-            minutes = _timedelta_minutes(delta)
-            if minutes in seen_minutes:
-                continue
-            seen_minutes.add(minutes)
-            ordered_windows.append((label, delta))
-        for idx, row in events.iterrows():
-            category = "Fake move" if row.get("fake_any") is True else "Sustained move"
-            if pd.isna(row.get("fake_any")):
-                category = "Incomplete"
-            for label, delta in ordered_windows:
-                col = f"return_{label}_pct"
-                if col not in events.columns:
+        def build_fake_probability() -> go.Figure | None:
+            probability_records = list(self._result.summary.fake_probability_by_surprise)
+            if not probability_records:
+                return None
+            df = pd.DataFrame(probability_records)
+            if df.empty:
+                return None
+            df = df[df["sample_size"] > 0].sort_values("avg_surprise")
+            if df.empty:
+                return None
+            logger.debug(
+                "Fake-out probability chart using %d bins (total samples=%d)",
+                len(df),
+                int(df["sample_size"].sum()),
+            )
+            fig = px.line(
+                df,
+                x="avg_surprise",
+                y="fake_rate_pct",
+                markers=True,
+                hover_data={
+                    "sample_size": True,
+                    "label": True,
+                },
+            )
+            fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+            fig.update_layout(
+                title="Fake-out probability vs surprise",
+                xaxis_title="Average surprise in bin (%)",
+                yaxis_title="Fake-out rate (%)",
+            )
+            return fig
+
+        def build_fake_duration_distribution() -> go.Figure | None:
+            if "fake_duration_minutes" not in events.columns:
+                return None
+            series = events["fake_duration_minutes"].dropna()
+            if series.empty:
+                return None
+            sample_count = int(series.size)
+            logger.debug(
+                "Fake duration distribution chart using %d samples", sample_count
+            )
+            nbins = min(30, max(6, int(sample_count ** 0.5)))
+            fig = go.Figure()
+            fig.add_trace(
+                go.Histogram(
+                    x=series,
+                    nbinsx=nbins,
+                    marker_color="#636EFA",
+                    opacity=0.85,
+                    name="Durations",
+                )
+            )
+            mean_value = float(series.mean())
+            median_value = float(series.median())
+            fig.add_vline(
+                x=mean_value,
+                line_dash="dash",
+                line_color="#2563eb",
+                annotation_text=f"Mean {mean_value:.0f}m",
+                annotation_position="top right",
+            )
+            fig.add_vline(
+                x=median_value,
+                line_dash="dot",
+                line_color="#ef4444",
+                annotation_text=f"Median {median_value:.0f}m",
+                annotation_position="top left",
+            )
+            fig.update_layout(
+                title="Distribution of fake move durations",
+                xaxis_title="Minutes",
+                yaxis_title="Count",
+                bargap=0.05,
+                showlegend=False,
+            )
+            return fig
+
+        def build_duration_by_surprise() -> go.Figure | None:
+            if "fake_duration_minutes" not in events.columns:
+                return None
+            df = events.dropna(subset=["fake_duration_minutes"])
+            if df.empty:
+                return None
+            grouped = (
+                df.groupby("surprise_type", dropna=False)["fake_duration_minutes"].mean().dropna()
+            )
+            if grouped.empty:
+                return None
+            records = grouped.reset_index(name="avg_minutes")
+            records["avg_minutes"] = records["avg_minutes"].astype(float)
+            logger.debug(
+                "Duration by surprise chart using %d groups", len(records)
+            )
+            fig = px.bar(
+                records,
+                x="surprise_type",
+                y="avg_minutes",
+            )
+            fig.update_layout(
+                title="Average reversal time by surprise type",
+                xaxis_title="Surprise type",
+                yaxis_title="Average minutes",
+            )
+            return fig
+
+        def build_price_trajectories() -> go.Figure | None:
+            if self._price_series.empty:
+                return None
+            if "fake_any" not in events.columns:
+                return None
+            categories = {"Fake move": 0, "Sustained move": 0}
+            max_per_category = 5
+            records: list[dict[str, float]] = []
+            price_series = self._price_series.sort_index()
+            price_tz = price_series.index.tz
+            for idx, row in events.iterrows():
+                fake_value = row.get("fake_any")
+                if pd.isna(fake_value):
                     continue
-                value = row.get(col)
-                if value is None or (isinstance(value, float) and math.isnan(value)):
+                category = "Fake move" if bool(fake_value) else "Sustained move"
+                if categories.get(category, 0) >= max_per_category:
                     continue
-                time_records.append({
-                    "category": category,
-                    "minutes": _timedelta_minutes(delta),
-                    "label": label,
-                    "return_pct": float(value),
-                })
-        if time_records:
-            trajectory_df = pd.DataFrame(time_records)
-            trajectory_df = trajectory_df[trajectory_df["category"] != "Incomplete"]
-            if not trajectory_df.empty:
-                trajectory_summary = (
-                    trajectory_df.groupby(["category", "minutes", "label"], as_index=False)["return_pct"].mean()
-                )
-                logger.debug(
-                    "Building price trajectory chart with %d aggregated points",
-                    len(trajectory_summary),
-                )
-                trajectory_fig = px.line(
-                    trajectory_summary,
-                    x="minutes",
-                    y="return_pct",
-                    color="category",
-                    markers=True,
-                    hover_data={"label": True},
-                )
-                trajectory_fig.update_layout(
-                    title="Average price trajectory",
-                    xaxis_title="Minutes from release",
-                    yaxis_title="Return (%)",
-                )
-                figures["price_trajectories"] = self._serialize_figure(trajectory_fig)
+                release_value = row.get("release_datetime")
+                base_price = row.get("base_price")
+                if pd.isna(release_value):
+                    continue
+                release_ts = pd.Timestamp(release_value)
+                if release_ts.tzinfo is None:
+                    release_ts = release_ts.tz_localize(price_tz)
+                else:
+                    release_ts = release_ts.tz_convert(price_tz)
+                start = release_ts - self._price_window_before
+                end = release_ts + self._price_window_after
+                window = price_series.loc[start:end].dropna().copy()
+                if window.empty:
+                    continue
+                base_value: float | None
+                if base_price is None or (isinstance(base_price, float) and math.isnan(base_price)):
+                    base_value = _price_at(price_series, release_ts)
+                else:
+                    base_value = float(base_price)
+                if base_value is None or base_value == 0.0:
+                    continue
+                if release_ts not in window.index:
+                    window.loc[release_ts] = base_value
+                    window.sort_index(inplace=True)
+                normalized = (window / base_value) * 100.0
+                for ts, value in normalized.items():
+                    minutes = (ts - release_ts).total_seconds() / 60.0
+                    records.append(
+                        {
+                            "event_id": idx,
+                            "category": category,
+                            "minutes": minutes,
+                            "normalized_price": float(value),
+                            "release": release_ts.isoformat(),
+                        }
+                    )
+                categories[category] = categories.get(category, 0) + 1
+            if not records:
+                return None
+            df = pd.DataFrame(records)
+            if df.empty:
+                return None
+            df.sort_values(["category", "event_id", "minutes"], inplace=True)
+            unique_events = df["event_id"].nunique()
+            logger.debug(
+                "Price trajectory chart using %d points from %d releases", len(df), unique_events
+            )
+            fig = px.line(
+                df,
+                x="minutes",
+                y="normalized_price",
+                color="category",
+                line_group="event_id",
+                hover_data={"release": True},
+            )
+            fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
+            fig.add_hline(y=100, line_dash="dot", line_color="#94a3b8")
+            fig.update_layout(
+                title="Normalized BTC price trajectories",
+                xaxis_title="Minutes from release",
+                yaxis_title="Normalized price (release = 100)",
+            )
+            return fig
+
+        register(
+            "fake_by_window",
+            build_fake_by_window,
+            "No evaluation windows contain fake-out data.",
+        )
+        register(
+            "fake_by_surprise",
+            build_fake_by_surprise_type,
+            "No fake-out data available by surprise category.",
+        )
+        register(
+            "timeline",
+            build_timeline,
+            "Evaluation window returns are required to plot the timeline.",
+        )
+        register(
+            "surprise_distribution",
+            build_surprise_distribution,
+            "CPI surprise data is unavailable.",
+        )
+        register(
+            "reaction_vs_surprise",
+            build_reaction_vs_surprise,
+            "Need CPI surprise values and reaction returns to build this chart.",
+        )
+        register(
+            "fake_probability",
+            build_fake_probability,
+            "Need fake-out classifications and CPI surprises to estimate probabilities.",
+        )
+        register(
+            "fake_durations",
+            build_fake_duration_distribution,
+            "Fake-out durations are unavailable for this dataset.",
+        )
+        register(
+            "duration_by_surprise",
+            build_duration_by_surprise,
+            "Fake-out durations by surprise type are unavailable.",
+        )
+        register(
+            "price_trajectories",
+            build_price_trajectories,
+            "Price history around CPI releases is required to show trajectories.",
+        )
 
         self._figures = figures
+        self._figure_messages = messages
+        logger.debug("Generated %d Plotly figures", len(figures))
 
     def _prepare_table_and_price_windows(self) -> None:
         events = self._events
@@ -915,6 +1076,7 @@ class DashboardBuilder:
         html_table = json.dumps(self._table_rows, allow_nan=False)
         html_prices = json.dumps(self._price_windows, allow_nan=False)
         html_cards = json.dumps(self._summary_cards, allow_nan=False)
+        html_messages = json.dumps(self._figure_messages, ensure_ascii=False)
         plotly_lib_js = self._plotly_loader_script()
 
         html = f"""<!DOCTYPE html>
@@ -1358,6 +1520,7 @@ class DashboardBuilder:
   {plotly_lib_js}
   <script>
     const figures = {html_figures};
+    const figureMessages = {html_messages};
     const tableRows = {html_table};
     const priceWindows = {html_prices};
     const summaryCards = {html_cards};
@@ -1406,7 +1569,8 @@ class DashboardBuilder:
         if (!chartNode) return;
         const chartId = chartNode.id;
         if (rendered.has(chartId)) return;
-        chartNode.innerHTML = '<p style="color: var(--text-secondary);">No data available for this chart.</p>';
+        const message = figureMessages[chartId] || 'No data available for this chart.';
+        chartNode.innerHTML = `<p style="color: var(--text-secondary);">${{message}}</p>`;
         card.querySelectorAll(`button[data-chart-id="${{chartId}}"]`).forEach(button => {{
           button.disabled = true;
           button.style.opacity = '0.55';
