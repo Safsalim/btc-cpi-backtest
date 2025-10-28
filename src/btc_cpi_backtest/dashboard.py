@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import html
 import json
 import math
+import re
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Sequence
+from typing import Any, Dict, Iterable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -77,6 +79,8 @@ class DashboardBuilder:
         neutral_surprise_band: float = 0.05,
         price_window_before: timedelta = timedelta(hours=6),
         price_window_after: timedelta = timedelta(hours=12),
+        plotly_js_mode: Literal["cdn", "inline"] = "cdn",
+        plotly_cdn_url: str | None = None,
     ) -> None:
         self._result = result
         self._releases = list(releases)
@@ -85,6 +89,12 @@ class DashboardBuilder:
         self._neutral_surprise_band = neutral_surprise_band
         self._price_window_before = price_window_before
         self._price_window_after = price_window_after
+
+        normalized_mode = plotly_js_mode.lower()
+        if normalized_mode not in {"cdn", "inline"}:
+            raise ValueError(f"Unsupported Plotly JS mode: {plotly_js_mode!r}")
+        self._plotly_js_mode = normalized_mode
+        self._plotly_cdn_url = plotly_cdn_url
 
         self._events = result.events.copy()
         self._reaction_windows = list(config.reaction_windows)
@@ -108,6 +118,13 @@ class DashboardBuilder:
             self._prepare_table_and_price_windows()
             self._processed = True
         return self._render_template()
+
+    def _serialize_figure(self, figure: go.Figure) -> dict[str, Any]:
+        try:
+            serialized = json.loads(pio.to_json(figure, validate=False))
+        except Exception as exc:  # pragma: no cover - defensive guard around Plotly internals
+            raise RuntimeError("Failed to serialize Plotly figure; try switching to the mpld3 backend or inline Plotly mode.") from exc
+        return serialized
 
     def _prepare_events(self) -> None:
         events = self._events
@@ -297,7 +314,7 @@ class DashboardBuilder:
             fake_rate_fig.update_yaxes(title="Fake-out rate (%)")
             fake_rate_fig.update_xaxes(title="Evaluation window")
             fake_rate_fig.update_layout(title="Fake-out rates by evaluation window")
-            figures["fake_by_window"] = json.loads(pio.to_json(fake_rate_fig, validate=False))
+            figures["fake_by_window"] = self._serialize_figure(fake_rate_fig)
 
         # Fake-out rates by surprise type (grouped)
         grouped_records = []
@@ -328,7 +345,7 @@ class DashboardBuilder:
             grouped_fig.update_yaxes(title="Fake-out rate (%)")
             grouped_fig.update_xaxes(title="Surprise type")
             grouped_fig.update_layout(title="Fake-out rates by surprise type")
-            figures["fake_by_surprise"] = json.loads(pio.to_json(grouped_fig, validate=False))
+            figures["fake_by_surprise"] = self._serialize_figure(grouped_fig)
 
         # Timeline scatter of CPI releases
         if self._primary_evaluation:
@@ -363,7 +380,7 @@ class DashboardBuilder:
                     yaxis_title=f"Return {self._primary_evaluation} (%)",
                     xaxis_title="Release datetime",
                 )
-                figures["timeline"] = json.loads(pio.to_json(timeline_fig, validate=False))
+                figures["timeline"] = self._serialize_figure(timeline_fig)
 
         # Distribution of CPI surprises
         if not events["cpi_surprise"].dropna().empty:
@@ -378,7 +395,7 @@ class DashboardBuilder:
                 xaxis_title="Surprise (actual - expected, %)",
                 yaxis_title="Count",
             )
-            figures["surprise_distribution"] = json.loads(pio.to_json(surprise_hist, validate=False))
+            figures["surprise_distribution"] = self._serialize_figure(surprise_hist)
 
         # Price reaction vs surprise magnitude
         if self._primary_reaction:
@@ -409,7 +426,7 @@ class DashboardBuilder:
                     xaxis_title="CPI surprise (%)",
                     yaxis_title=f"Return {self._primary_reaction} (%)",
                 )
-                figures["reaction_vs_surprise"] = json.loads(pio.to_json(scatter_fig, validate=False))
+                figures["reaction_vs_surprise"] = self._serialize_figure(scatter_fig)
 
         # Fake-out probability vs surprise magnitude
         if self._primary_evaluation:
@@ -450,7 +467,7 @@ class DashboardBuilder:
                             xaxis_title="Average surprise in bin (%)",
                             yaxis_title="Fake-out rate (%)",
                         )
-                        figures["fake_probability"] = json.loads(pio.to_json(fake_prob_fig, validate=False))
+                        figures["fake_probability"] = self._serialize_figure(fake_prob_fig)
 
         # Fake move duration distribution (histogram + box)
         if "fake_duration_minutes" in events.columns:
@@ -477,7 +494,7 @@ class DashboardBuilder:
                 subplot_fig.update_yaxes(title_text="Count", row=1, col=1)
                 subplot_fig.update_xaxes(title_text="Minutes", row=1, col=2)
                 subplot_fig.update_layout(title="Distribution of fake move durations", showlegend=False)
-                figures["fake_durations"] = json.loads(pio.to_json(subplot_fig, validate=False))
+                figures["fake_durations"] = self._serialize_figure(subplot_fig)
 
             # Average reversal time by surprise type
             grouped_duration = (
@@ -496,7 +513,7 @@ class DashboardBuilder:
                     xaxis_title="Surprise type",
                     yaxis_title="Average minutes",
                 )
-                figures["duration_by_surprise"] = json.loads(pio.to_json(duration_fig, validate=False))
+                figures["duration_by_surprise"] = self._serialize_figure(duration_fig)
 
         # Price movement trajectories for fake vs sustained moves
         time_records = []
@@ -548,7 +565,7 @@ class DashboardBuilder:
                     xaxis_title="Minutes from release",
                     yaxis_title="Return (%)",
                 )
-                figures["price_trajectories"] = json.loads(pio.to_json(trajectory_fig, validate=False))
+                figures["price_trajectories"] = self._serialize_figure(trajectory_fig)
 
         self._figures = figures
 
@@ -659,6 +676,40 @@ class DashboardBuilder:
         self._table_rows = table_rows
         self._price_windows = price_windows
 
+    def _plotly_loader_script(self) -> str:
+        if self._plotly_js_mode == "cdn":
+            url = self._plotly_cdn_url or "https://cdn.plot.ly/plotly-latest.min.js"
+            return f'<script src="{url}" crossorigin="anonymous"></script>'
+        try:
+            from plotly import offline as plotly_offline  # type: ignore
+        except ImportError as exc:  # pragma: no cover - dependency guard
+            raise RuntimeError(
+                "Plotly offline support is unavailable. Install 'plotly' or switch to the CDN backend."
+            ) from exc
+
+        try:
+            plotly_lib_js_content = plotly_offline.get_plotlyjs()
+        except Exception:
+            try:
+                dummy_div = plotly_offline.plot(  # type: ignore[arg-type]
+                    {"data": [], "layout": {}},
+                    include_plotlyjs=True,
+                    output_type="div",
+                    auto_open=False,
+                    show_link=False,
+                )
+            except Exception as plot_exc:  # pragma: no cover - defensive guard
+                raise RuntimeError(
+                    "Unable to retrieve the Plotly.js offline bundle. Ensure the 'plotly' package is fully installed or select the CDN backend."
+                ) from plot_exc
+            script_match = re.search(r"<script[^>]*>(.*?)</script>", dummy_div, flags=re.DOTALL)
+            if not script_match:
+                raise RuntimeError(
+                    "Failed to extract the Plotly.js script from the offline HTML output."
+                )
+            plotly_lib_js_content = script_match.group(1)
+        return f"<script>{plotly_lib_js_content}</script>"
+
     def _render_template(self) -> str:
         config = {
             "responsive": True,
@@ -669,11 +720,7 @@ class DashboardBuilder:
         html_table = json.dumps(self._table_rows, allow_nan=False)
         html_prices = json.dumps(self._price_windows, allow_nan=False)
         html_cards = json.dumps(self._summary_cards, allow_nan=False)
-        try:
-            plotly_lib_js_content = pio.get_plotlyjs()
-        except Exception as exc:  # pragma: no cover - defensive guard
-            raise RuntimeError("Unable to retrieve Plotly.js bundle.") from exc
-        plotly_lib_js = f"<script>{plotly_lib_js_content}</script>"
+        plotly_lib_js = self._plotly_loader_script()
 
         html = f"""<!DOCTYPE html>
 <html lang=\"en\">
@@ -1399,6 +1446,181 @@ class DashboardBuilder:
         return html
 
 
+def _render_mpld3_dashboard(
+    *,
+    result: FakeoutAnalysisResult,
+    config: FakeoutConfig,
+    error_message: str | None = None,
+) -> str:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+        import mpld3  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "mpld3 backend is not available. Install it with 'pip install mpld3' or select a Plotly backend."
+        ) from exc
+
+    events = result.events.copy()
+    primary_evaluation = config.evaluation_windows[0][0] if config.evaluation_windows else None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_title("BTC CPI Fake-out Overview")
+    ax.set_xlabel("Release datetime")
+    ax.set_ylabel("Return (%)")
+
+    plotted = False
+    if not events.empty and primary_evaluation:
+        column = f"return_{primary_evaluation}_pct"
+        if column in events.columns:
+            timeline = events.dropna(subset=["release_datetime", column]).copy()
+            if not timeline.empty:
+                timeline["release_datetime"] = pd.to_datetime(timeline["release_datetime"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+                timeline.sort_values("release_datetime", inplace=True)
+                ax.plot(
+                    timeline["release_datetime"],
+                    timeline[column],
+                    marker="o",
+                    linestyle="-",
+                    color="#2563eb",
+                    label=f"{primary_evaluation} return",
+                )
+                ax.axhline(0.0, color="#9ca3af", linestyle="--", linewidth=1)
+                ax.legend(loc="best")
+                plotted = True
+
+    if not plotted:
+        ax.text(
+            0.5,
+            0.5,
+            "No evaluation window return data available for mpld3 fallback.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color="#6b7280",
+        )
+
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    figure_html = mpld3.fig_to_html(fig)
+    plt.close(fig)
+
+    available_columns = [
+        "release_datetime",
+        "cpi_actual",
+        "cpi_expected",
+        "cpi_surprise",
+    ]
+    if primary_evaluation:
+        return_column = f"return_{primary_evaluation}_pct"
+        available_columns.append(return_column)
+    available_columns = [column for column in available_columns if column in events.columns]
+
+    if available_columns:
+        preview = events[available_columns].copy()
+        if "release_datetime" in preview.columns:
+            preview["release_datetime"] = pd.to_datetime(preview["release_datetime"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+        numeric_columns = preview.select_dtypes(include=["number"]).columns
+        preview[numeric_columns] = preview[numeric_columns].round(3)
+        preview = preview.head(25)
+        table_html = preview.to_html(index=False, classes="fallback-table")
+    else:
+        table_html = "<p>No CPI release data is available for summary display.</p>"
+
+    alert_block = ""
+    if error_message:
+        alert_block = (
+            "<div class=\"alert\">"
+            f"Plotly dashboard generation failed: {html.escape(error_message)}"
+            "</div>"
+        )
+
+    fallback_html = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>BTC CPI Fake-out Dashboard (mpld3 fallback)</title>
+  <style>
+    body {{
+      font-family: 'Inter', 'Segoe UI', sans-serif;
+      margin: 0;
+      padding: 2rem 1.25rem 4rem;
+      background: #f9fafb;
+      color: #111827;
+    }}
+    .container {{
+      max-width: 960px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 1.75rem;
+    }}
+    header h1 {{
+      margin-bottom: 0.35rem;
+      font-size: 1.9rem;
+    }}
+    header p {{
+      color: #4b5563;
+      margin: 0;
+    }}
+    .alert {{
+      background: #fee2e2;
+      border: 1px solid #fecaca;
+      color: #b91c1c;
+      padding: 1rem 1.25rem;
+      border-radius: 0.75rem;
+      box-shadow: 0 12px 24px rgba(239, 68, 68, 0.18);
+    }}
+    .card {{
+      background: #ffffff;
+      border-radius: 1rem;
+      padding: 1.5rem;
+      box-shadow: 0 18px 35px rgba(15, 23, 42, 0.08);
+      border: 1px solid #e5e7eb;
+    }}
+    table.fallback-table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }}
+    table.fallback-table th,
+    table.fallback-table td {{
+      border: 1px solid #e5e7eb;
+      padding: 0.6rem 0.75rem;
+      text-align: left;
+    }}
+    table.fallback-table th {{
+      background: #f3f4f6;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.75rem;
+      color: #6b7280;
+    }}
+  </style>
+</head>
+<body>
+  <div class=\"container\">
+    <header>
+      <h1>BTC CPI Fake-out Dashboard</h1>
+      <p>This simplified dashboard uses matplotlib + mpld3 as a fallback rendering backend.</p>
+    </header>
+    {alert_block}
+    <section class=\"card\">
+      <h2 style=\"margin-top: 0;\">Evaluation window returns</h2>
+      {figure_html}
+      <p style=\"color: #4b5563; font-size: 0.85rem;\">Tooltips, zooming, and panning are provided by mpld3.</p>
+    </section>
+    <section class=\"card\">
+      <h2 style=\"margin-top: 0;\">Recent CPI releases</h2>
+      {table_html}
+    </section>
+  </div>
+</body>
+</html>
+"""
+    return fallback_html
+
+
 def render_dashboard_html(
     *,
     result: FakeoutAnalysisResult,
@@ -1410,19 +1632,60 @@ def render_dashboard_html(
     neutral_surprise_band: float = 0.05,
     price_window_before: timedelta = timedelta(hours=6),
     price_window_after: timedelta = timedelta(hours=12),
+    dashboard_backend: Literal["plotly-cdn", "plotly-inline", "mpld3"] = "plotly-cdn",
 ) -> Path:
-    """Render an interactive dashboard describing fake-out analysis results."""
+    """Render an interactive dashboard describing fake-out analysis results.
 
-    builder = DashboardBuilder(
-        result=result,
-        releases=releases,
-        price_series=price_series,
-        config=config,
-        neutral_surprise_band=neutral_surprise_band,
-        price_window_before=price_window_before,
-        price_window_after=price_window_after,
-    )
-    html = builder.build_html()
+    Args:
+        result: Fakeout analysis outcome describing returns and fake-out labels.
+        releases: Ordered CPI release metadata.
+        price_series: BTC price series used for price window charts.
+        config: Configuration describing reaction/evaluation windows.
+        output_path: Where to write the generated HTML.
+        open_browser: Whether to open the generated dashboard in a browser tab.
+        neutral_surprise_band: Surprise threshold for categorisation.
+        price_window_before: Duration before a release to include in price window charts.
+        price_window_after: Duration after a release to include in price window charts.
+        dashboard_backend: Rendering backend to use. "plotly-cdn" loads Plotly from the
+            public CDN, "plotly-inline" embeds the Plotly bundle directly, and "mpld3"
+            generates a simplified matplotlib + mpld3 dashboard.
+    """
+
+    backend_choice = dashboard_backend.lower()
+    if backend_choice not in {"plotly-cdn", "plotly-inline", "mpld3"}:
+        raise ValueError(
+            "dashboard_backend must be one of 'plotly-cdn', 'plotly-inline', or 'mpld3'."
+        )
+
+    html: str
+    if backend_choice == "mpld3":
+        html = _render_mpld3_dashboard(result=result, config=config)
+    else:
+        plotly_js_mode = "cdn" if backend_choice == "plotly-cdn" else "inline"
+        builder = DashboardBuilder(
+            result=result,
+            releases=releases,
+            price_series=price_series,
+            config=config,
+            neutral_surprise_band=neutral_surprise_band,
+            price_window_before=price_window_before,
+            price_window_after=price_window_after,
+            plotly_js_mode=plotly_js_mode,
+        )
+        try:
+            html = builder.build_html()
+        except RuntimeError as exc:
+            if backend_choice == "plotly-inline":
+                raise RuntimeError(
+                    "Plotly inline mode failed; ensure the offline Plotly bundle is available "
+                    "or switch to the 'plotly-cdn' backend."
+                ) from exc
+            html = _render_mpld3_dashboard(
+                result=result,
+                config=config,
+                error_message=str(exc),
+            )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
 

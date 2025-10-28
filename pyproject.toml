@@ -27,6 +27,7 @@ dependencies = [
 visualization = [
     "matplotlib>=3.7",
     "plotly>=5.15",
+    "mpld3>=0.5",
 ]
 dev = [
     "pytest>=7.4",
