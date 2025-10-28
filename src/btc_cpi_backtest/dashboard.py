@@ -16,7 +16,12 @@ import plotly.graph_objects as go
 from plotly import io as pio
 from plotly.subplots import make_subplots
 
-from .analysis import FakeoutAnalysisResult, FakeoutConfig, _classify_fakeout
+from .analysis import (
+    FakeoutAnalysisResult,
+    FakeoutConfig,
+    _classify_fakeout,
+    _compute_fake_probability_by_surprise,
+)
 from .cpi_loader import CPIRelease
 
 DEFAULT_DASHBOARD_PATH = Path("data") / "analysis_dashboard.html"
@@ -412,6 +417,47 @@ class DashboardBuilder:
             lambda value: _categorize_surprise(value, neutral_band=self._neutral_surprise_band)
         )
 
+        columns_list = list(events.columns)
+        logger.debug("Dashboard events columns after preparation: %s", columns_list)
+
+        def _extract_sample(series: pd.Series | None) -> list[Any]:
+            if series is None:
+                return []
+            values: list[Any] = []
+            for raw_value in series.head(5):
+                if pd.isna(raw_value):
+                    values.append(None)
+                    continue
+                if isinstance(raw_value, (np.bool_, bool)):
+                    values.append(bool(raw_value))
+                    continue
+                if isinstance(raw_value, (int, float, np.number)):
+                    values.append(float(raw_value))
+                    continue
+                values.append(raw_value)
+            return values
+
+        reaction_series: pd.Series | None = None
+        if "initial_reaction_return_pct" in events.columns:
+            reaction_series = events["initial_reaction_return_pct"]
+        elif self._primary_reaction:
+            candidate_column = f"return_{self._primary_reaction}_pct"
+            if candidate_column in events.columns:
+                reaction_series = events[candidate_column]
+
+        sample_surprise = _extract_sample(events.get("cpi_surprise"))
+        sample_reaction = _extract_sample(reaction_series)
+        sample_fake_any = _extract_sample(events.get("fake_any"))
+        sample_duration = _extract_sample(events.get("fake_duration_minutes"))
+
+        logger.debug(
+            "Sample metrics for dashboard charts (surprise=%s, reaction=%s, fake_any=%s, fake_duration=%s)",
+            sample_surprise,
+            sample_reaction,
+            sample_fake_any,
+            sample_duration,
+        )
+
         self._events = events
 
     def _build_summary_cards(self) -> None:
@@ -498,6 +544,21 @@ class DashboardBuilder:
                 messages[chart_id] = empty_message
                 logger.debug("Chart '%s' unavailable: %s", chart_id, empty_message)
                 return
+            trace_count = len(getattr(figure, "data", []) or [])
+            layout_obj = getattr(figure, "layout", None)
+            annotations = getattr(layout_obj, "annotations", None) if layout_obj is not None else None
+            if isinstance(annotations, (list, tuple)):
+                annotation_count = len(annotations)
+            elif annotations:
+                annotation_count = 1
+            else:
+                annotation_count = 0
+            logger.debug(
+                "Chart '%s' generated with %d traces (annotations=%d)",
+                chart_id,
+                trace_count,
+                annotation_count,
+            )
             figures[chart_id] = self._serialize_figure(figure)
 
         def build_fake_by_window() -> go.Figure | None:
@@ -619,16 +680,26 @@ class DashboardBuilder:
             return fig
 
         def build_surprise_distribution() -> go.Figure | None:
-            surprises = events["cpi_surprise"].dropna()
+            if "cpi_surprise" not in events.columns:
+                logger.debug("CPI surprise distribution chart aborted: missing 'cpi_surprise' column")
+                return None
+            surprises = events["cpi_surprise"].dropna().astype(float)
             if surprises.empty:
+                logger.debug("CPI surprise distribution chart aborted: no non-null surprises available")
                 return None
             sample_count = int(surprises.size)
+            min_surprise = float(surprises.min())
+            max_surprise = float(surprises.max())
             logger.debug(
-                "CPI surprise distribution chart using %d samples", sample_count
+                "CPI surprise distribution dataset: count=%d, min=%.3f, max=%.3f",
+                sample_count,
+                min_surprise,
+                max_surprise,
             )
             nbins = min(30, max(10, int(math.sqrt(sample_count))))
+            surprise_df = pd.DataFrame({"cpi_surprise": surprises})
             fig = px.histogram(
-                events,
+                surprise_df,
                 x="cpi_surprise",
                 nbins=nbins,
             )
@@ -641,94 +712,166 @@ class DashboardBuilder:
             return fig
 
         def build_reaction_vs_surprise() -> go.Figure | None:
-            if not self._primary_reaction:
+            required_columns = {"cpi_surprise", "initial_reaction_return_pct"}
+            missing_columns = [column for column in required_columns if column not in events.columns]
+            if missing_columns:
+                logger.debug(
+                    "Reaction vs surprise chart aborted: missing columns %s",
+                    missing_columns,
+                )
                 return None
-            reaction_column = f"return_{self._primary_reaction}_pct"
-            if reaction_column not in events.columns:
-                return None
-            df = events.dropna(subset=["cpi_surprise", reaction_column, "fake_any"])
+            working_columns = [
+                "cpi_surprise",
+                "initial_reaction_return_pct",
+                "fake_any",
+                "release_datetime",
+            ]
+            available_columns = [column for column in working_columns if column in events.columns]
+            df = events[available_columns].dropna(subset=["cpi_surprise", "initial_reaction_return_pct"])
             if df.empty:
+                logger.debug("Reaction vs surprise chart aborted: no complete surprise/reaction pairs")
                 return None
             df = df.copy()
-            df["outcome"] = np.where(df["fake_any"].astype(bool), "Fake move", "Sustained move")
+
+            def _classify_outcome(value: Any) -> str:
+                if pd.isna(value):
+                    return "Incomplete"
+                return "Fake move" if bool(value) else "Sustained move"
+
+            if "fake_any" in df.columns:
+                df["outcome"] = df["fake_any"].apply(_classify_outcome)
+            else:
+                df["outcome"] = "Unknown"
+            outcome_counts = df["outcome"].value_counts(dropna=False).to_dict()
             logger.debug(
-                "Reaction vs surprise chart using %d samples (fake=%d, sustained=%d)",
+                "Reaction vs surprise dataset: rows=%d, outcome_counts=%s",
                 len(df),
-                int((df["outcome"] == "Fake move").sum()),
-                int((df["outcome"] == "Sustained move").sum()),
+                outcome_counts,
             )
             fig = px.scatter(
                 df,
                 x="cpi_surprise",
-                y=reaction_column,
+                y="initial_reaction_return_pct",
                 color="outcome",
-                hover_name="release_datetime",
+                hover_name="release_datetime" if "release_datetime" in df.columns else None,
             )
             if len(df) >= 2:
-                x_vals = df["cpi_surprise"].to_numpy(float)
-                y_vals = df[reaction_column].to_numpy(float)
-                slope, intercept = np.polyfit(x_vals, y_vals, 1)
-                x_range = np.linspace(x_vals.min(), x_vals.max(), 100)
-                fig.add_trace(
-                    go.Scatter(
-                        x=x_range,
-                        y=slope * x_range + intercept,
-                        mode="lines",
-                        name="Trendline",
-                        line=dict(color="#EF553B", width=2),
+                x_vals = df["cpi_surprise"].astype(float).to_numpy()
+                y_vals = df["initial_reaction_return_pct"].astype(float).to_numpy()
+                try:
+                    slope, intercept = np.polyfit(x_vals, y_vals, 1)
+                except (np.linalg.LinAlgError, ValueError) as exc:  # pragma: no cover - defensive guard
+                    logger.debug("Reaction vs surprise trendline skipped: %s", exc)
+                else:
+                    x_range = np.linspace(x_vals.min(), x_vals.max(), 100)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_range,
+                            y=slope * x_range + intercept,
+                            mode="lines",
+                            name="Trendline",
+                            line=dict(color="#EF553B", width=2),
+                        )
                     )
-                )
             fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
             fig.update_traces(marker=dict(size=10, opacity=0.85))
             fig.update_layout(
-                title=f"Price reaction vs CPI surprise ({self._primary_reaction})",
+                title="Price reaction vs CPI surprise",
                 xaxis_title="CPI surprise (%)",
-                yaxis_title=f"Return {self._primary_reaction} (%)",
+                yaxis_title="Initial reaction return (%)",
             )
             return fig
 
         def build_fake_probability() -> go.Figure | None:
-            probability_records = list(self._result.summary.fake_probability_by_surprise)
+            required_columns = {"cpi_surprise", "fake_any"}
+            missing_columns = [column for column in required_columns if column not in events.columns]
+            if missing_columns:
+                logger.debug(
+                    "Fake probability chart aborted: missing columns %s",
+                    missing_columns,
+                )
+                return None
+            probability_records = _compute_fake_probability_by_surprise(events)
             if not probability_records:
+                logger.debug("Fake probability chart aborted: insufficient data to build bins")
                 return None
             df = pd.DataFrame(probability_records)
             if df.empty:
+                logger.debug("Fake probability chart aborted: computed dataset is empty")
                 return None
             df = df[df["sample_size"] > 0].sort_values("avg_surprise")
             if df.empty:
+                logger.debug("Fake probability chart aborted: no bins with samples")
                 return None
+            total_samples = int(df["sample_size"].sum())
             logger.debug(
-                "Fake-out probability chart using %d bins (total samples=%d)",
+                "Fake probability vs surprise dataset: bins=%d, total_samples=%d, fake_rate_mean=%.3f",
                 len(df),
-                int(df["sample_size"].sum()),
+                total_samples,
+                float(df["fake_rate"].mean()),
             )
-            fig = px.line(
-                df,
-                x="avg_surprise",
-                y="fake_rate_pct",
-                markers=True,
-                hover_data={
-                    "sample_size": True,
-                    "label": True,
-                },
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=df["label"],
+                    y=df["fake_rate_pct"],
+                    name="Fake rate (%)",
+                    marker_color="#636EFA",
+                    customdata=[(float(avg), int(size)) for avg, size in zip(df["avg_surprise"], df["sample_size"])],
+                    hovertemplate=(
+                        "Surprise bin %{x}<br>Avg surprise %{customdata[0]:.2f}"
+                        "<br>Fake rate %{y:.1f}%<br>Samples %{customdata[1]}<extra></extra>"
+                    ),
+                )
             )
-            fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+            fig.add_trace(
+                go.Scatter(
+                    x=df["label"],
+                    y=df["sample_size"],
+                    name="Sample size",
+                    mode="lines+markers",
+                    yaxis="y2",
+                    line=dict(color="#EF553B", width=2),
+                    marker=dict(size=8),
+                    hovertemplate="Surprise bin %{x}<br>Sample size %{y}<extra></extra>",
+                )
+            )
             fig.update_layout(
                 title="Fake-out probability vs surprise",
-                xaxis_title="Average surprise in bin (%)",
-                yaxis_title="Fake-out rate (%)",
+                xaxis_title="CPI surprise bin",
+                yaxis=dict(title="Fake-out rate (%)"),
+                yaxis2=dict(
+                    title="Sample size",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                ),
+                bargap=0.15,
             )
             return fig
 
         def build_fake_duration_distribution() -> go.Figure | None:
-            if "fake_duration_minutes" not in events.columns:
+            required_columns = {"fake_duration_minutes", "fake_any"}
+            missing_columns = [column for column in required_columns if column not in events.columns]
+            if missing_columns:
+                logger.debug(
+                    "Fake duration chart aborted: missing columns %s",
+                    missing_columns,
+                )
                 return None
-            series = events["fake_duration_minutes"].dropna()
+            fake_mask = events["fake_any"].fillna(False).astype(bool)
+            series = events.loc[fake_mask, "fake_duration_minutes"].dropna().astype(float)
             if series.empty:
+                logger.debug("Fake duration chart aborted: no durations for confirmed fake moves")
                 return None
             sample_count = int(series.size)
+            mean_value = float(series.mean())
+            median_value = float(series.median())
             logger.debug(
-                "Fake duration distribution chart using %d samples", sample_count
+                "Fake duration dataset: count=%d, mean=%.2f, median=%.2f",
+                sample_count,
+                mean_value,
+                median_value,
             )
             nbins = min(30, max(6, int(sample_count ** 0.5)))
             fig = go.Figure()
@@ -741,8 +884,6 @@ class DashboardBuilder:
                     name="Durations",
                 )
             )
-            mean_value = float(series.mean())
-            median_value = float(series.median())
             fig.add_vline(
                 x=mean_value,
                 line_dash="dash",
@@ -796,8 +937,10 @@ class DashboardBuilder:
 
         def build_price_trajectories() -> go.Figure | None:
             if self._price_series.empty:
+                logger.debug("Price trajectory chart aborted: price series is empty")
                 return None
             if "fake_any" not in events.columns:
+                logger.debug("Price trajectory chart aborted: missing 'fake_any' column")
                 return None
             categories = {"Fake move": 0, "Sustained move": 0}
             max_per_category = 5
@@ -848,15 +991,21 @@ class DashboardBuilder:
                         }
                     )
                 categories[category] = categories.get(category, 0) + 1
+            logger.debug("Price trajectory sampling counts by category: %s", categories)
             if not records:
+                logger.debug("Price trajectory chart aborted: no qualifying price windows found")
                 return None
             df = pd.DataFrame(records)
             if df.empty:
+                logger.debug("Price trajectory chart aborted: normalized dataset is empty")
                 return None
             df.sort_values(["category", "event_id", "minutes"], inplace=True)
             unique_events = df["event_id"].nunique()
             logger.debug(
-                "Price trajectory chart using %d points from %d releases", len(df), unique_events
+                "Price trajectory chart using %d points from %d releases (categories=%s)",
+                len(df),
+                unique_events,
+                categories,
             )
             fig = px.line(
                 df,
