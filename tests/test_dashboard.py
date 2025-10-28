@@ -30,5 +30,6 @@ def test_render_dashboard_html(tmp_path: Path) -> None:
     assert "BTC vs CPI Fake-out Dashboard" in html_content
     assert "fake_by_window" in html_content
     assert "tableRows" in html_content
+    assert "figureMessages" in html_content
     assert "Plotly" in html_content
     assert "cdn.plot.ly" not in html_content

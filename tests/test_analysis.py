@@ -79,6 +79,14 @@ def test_fakeout_analysis_classifies_reversals() -> None:
     # Missing 4h data for the third release should mark fake classification as None
     assert events.loc[2, "fake_5m_4h"] is None
 
+    assert "initial_reaction_return_pct" in events.columns
+    assert events.loc[0, "initial_reaction_window"] == "5m"
+    assert pytest.approx(events.loc[0, "initial_reaction_return_pct"], rel=1e-6) == 2.0
+    assert pytest.approx(events.loc[1, "initial_reaction_return_pct"], rel=1e-6) == -2.5
+    assert pytest.approx(events.loc[0, "fake_duration_minutes"], rel=1e-6) == 60.0
+    assert pytest.approx(events.loc[1, "fake_duration_minutes"], rel=1e-6) == 60.0
+    assert pd.isna(events.loc[2, "fake_duration_minutes"])
+
     summary = result.summary
     stats_5m_1h = summary.fake_out_stats["5m"]["1h"]
     assert stats_5m_1h.total == 3
@@ -90,6 +98,13 @@ def test_fakeout_analysis_classifies_reversals() -> None:
 
     correlation = summary.surprise_correlations["1h"]
     assert not math.isnan(correlation)
+
+    assert summary.fake_probability_by_surprise
+    for bucket in summary.fake_probability_by_surprise:
+        assert {"fake_rate", "sample_size", "avg_surprise"}.issubset(bucket.keys())
+    duration_stats = summary.fake_duration_stats
+    assert duration_stats["count"] == 2
+    assert pytest.approx(duration_stats["median"], rel=1e-6) == 60.0
 
 
 def test_analyze_fakeouts_handles_missing_base_price() -> None:
