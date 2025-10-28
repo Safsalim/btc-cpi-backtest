@@ -647,6 +647,8 @@ class DashboardBuilder:
                 logger.debug("Chart '%s' unavailable: %s", chart_id, empty_message)
                 return
             trace_count = len(getattr(figure, "data", []) or [])
+            if trace_count == 0:
+                logger.warning("Chart '%s' produced a figure with zero traces", chart_id)
             layout_obj = getattr(figure, "layout", None)
             annotations = getattr(layout_obj, "annotations", None) if layout_obj is not None else None
             if isinstance(annotations, (list, tuple)):
@@ -655,11 +657,29 @@ class DashboardBuilder:
                 annotation_count = 1
             else:
                 annotation_count = 0
+            preview_payload: dict[str, Any] = {}
+            try:
+                preview_payload = figure.to_plotly_json()
+            except Exception as payload_exc:  # pragma: no cover - defensive guard around Plotly internals
+                logger.debug(
+                    "Chart '%s' payload serialization skipped due to: %s",
+                    chart_id,
+                    payload_exc,
+                )
+            data_preview = preview_payload.get("data", []) if preview_payload else []
+            if isinstance(data_preview, list) and data_preview:
+                try:
+                    preview_text = json.dumps(data_preview[:1], default=str)[:500]
+                except TypeError:
+                    preview_text = str(data_preview[:1])[:500]
+            else:
+                preview_text = "[]"
             logger.debug(
-                "Chart '%s' generated with %d traces (annotations=%d)",
+                "Chart '%s' generated with %d traces (annotations=%d) data_preview=%s",
                 chart_id,
                 trace_count,
                 annotation_count,
+                preview_text,
             )
             figures[chart_id] = self._serialize_figure(figure)
 
@@ -803,19 +823,34 @@ class DashboardBuilder:
                 range_max,
             )
             nbins = min(30, max(10, int(math.sqrt(sample_count))))
-            surprise_df = pd.DataFrame({"cpi_surprise": surprises})
-            fig = px.histogram(
-                surprise_df,
-                x="cpi_surprise",
-                nbins=nbins,
-                range_x=[range_min, range_max],
+            logger.debug(
+                "CPI surprise distribution sample length=%d (nbins=%d)",
+                sample_count,
+                nbins,
             )
+            fig = go.Figure()
+            fig.add_trace(
+                go.Histogram(
+                    x=surprises.tolist(),
+                    nbinsx=nbins,
+                    name="CPI Surprises",
+                    marker=dict(color="#636EFA"),
+                    opacity=0.85,
+                )
+            )
+            fig.update_traces(showlegend=False)
             fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
             fig.update_xaxes(range=[range_min, range_max])
             fig.update_layout(
                 title="Distribution of CPI surprises",
                 xaxis_title="Surprise (actual - expected, %)",
                 yaxis_title="Count",
+            )
+            trace_points = len(getattr(fig.data[0], "x", []) or []) if fig.data else 0
+            logger.debug(
+                "CPI surprise distribution traces generated: %d (first trace points=%d)",
+                len(fig.data),
+                trace_points,
             )
             return fig
 
@@ -844,6 +879,7 @@ class DashboardBuilder:
             if df.empty:
                 logger.debug("Reaction vs surprise chart aborted: no complete surprise/reaction pairs")
                 return None
+            logger.debug("Reaction vs surprise sample length prior to plotting: %d", len(df))
 
             if "fake_any" in df.columns:
                 def _normalize_flag(value: Any) -> object:
@@ -882,20 +918,52 @@ class DashboardBuilder:
                 reaction_min,
                 reaction_max,
             )
-            fig = px.scatter(
-                df,
-                x="cpi_surprise",
-                y="initial_reaction_return_pct",
-                color="outcome",
-                hover_name="release_datetime" if "release_datetime" in df.columns else None,
-                category_orders={"outcome": ["Fake move", "Sustained move", "Incomplete", "Unknown"]},
-                color_discrete_map={
-                    "Fake move": "#EF553B",
-                    "Sustained move": "#636EFA",
-                    "Incomplete": "#94a3b8",
-                    "Unknown": "#a855f7",
-                },
-            )
+            if "release_datetime" in df.columns:
+                df["release_label"] = (
+                    pd.to_datetime(df["release_datetime"], utc=True)
+                    .dt.tz_convert("UTC")
+                    .dt.strftime("%Y-%m-%d %H:%M UTC")
+                )
+            color_map = {
+                "Fake move": "#EF553B",
+                "Sustained move": "#636EFA",
+                "Incomplete": "#94a3b8",
+                "Unknown": "#a855f7",
+            }
+            outcome_order = ["Fake move", "Sustained move", "Incomplete", "Unknown"]
+            fig = go.Figure()
+            for outcome in outcome_order:
+                subset = df[df["outcome"] == outcome]
+                if subset.empty:
+                    continue
+                customdata = None
+                hovertemplate = (
+                    "Surprise %{x:.2f}<br>Reaction %{y:.2f}%<extra>"
+                    f"{outcome}</extra>"
+                )
+                if "release_label" in subset.columns:
+                    release_labels = subset["release_label"].astype(str).tolist()
+                    if release_labels:
+                        customdata = np.array(release_labels, dtype=object).reshape(-1, 1)
+                        hovertemplate = (
+                            "Release %{customdata[0]}<br>Surprise %{x:.2f}<br>Reaction %{y:.2f}%<extra>"
+                            f"{outcome}</extra>"
+                        )
+                fig.add_trace(
+                    go.Scatter(
+                        x=subset["cpi_surprise"].astype(float),
+                        y=subset["initial_reaction_return_pct"].astype(float),
+                        mode="markers",
+                        name=outcome,
+                        marker=dict(
+                            color=color_map.get(outcome, "#636EFA"),
+                            size=10,
+                            opacity=0.85,
+                        ),
+                        customdata=customdata,
+                        hovertemplate=hovertemplate,
+                    )
+                )
             if len(df) >= 2:
                 x_vals = df["cpi_surprise"].astype(float).to_numpy()
                 y_vals = df["initial_reaction_return_pct"].astype(float).to_numpy()
@@ -912,14 +980,20 @@ class DashboardBuilder:
                             mode="lines",
                             name="Trendline",
                             line=dict(color="#EF553B", width=2),
+                            hovertemplate="Surprise %{x:.2f}<br>Trend %{y:.2f}%<extra>Trendline</extra>",
                         )
                     )
             fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
-            fig.update_traces(marker=dict(size=10, opacity=0.85))
             fig.update_layout(
                 title="Price reaction vs CPI surprise",
                 xaxis_title="CPI surprise (%)",
                 yaxis_title="Initial reaction return (%)",
+            )
+            point_counts = [len(getattr(trace, "x", []) or []) for trace in fig.data]
+            logger.debug(
+                "Reaction vs surprise traces generated: %d (point_counts=%s)",
+                len(fig.data),
+                point_counts,
             )
             return fig
 
@@ -1054,6 +1128,12 @@ class DashboardBuilder:
                 bargap=0.05,
                 showlegend=False,
             )
+            trace_points = len(getattr(fig.data[0], "x", []) or []) if fig.data else 0
+            logger.debug(
+                "Fake duration histogram traces generated: %d (first trace points=%d)",
+                len(fig.data),
+                trace_points,
+            )
             return fig
 
         def build_duration_by_surprise() -> go.Figure | None:
@@ -1156,20 +1236,55 @@ class DashboardBuilder:
                 unique_events,
                 categories,
             )
-            fig = px.line(
-                df,
-                x="minutes",
-                y="normalized_price",
-                color="category",
-                line_group="event_id",
-                hover_data={"release": True},
-            )
+            fig = go.Figure()
+            color_map = {"Fake move": "#EF553B", "Sustained move": "#636EFA"}
+            legend_tracker: set[str] = set()
+            for (event_id, category), group in df.groupby(["event_id", "category"]):
+                color = color_map.get(category, "#636EFA")
+                legendgroup = category
+                showlegend = category not in legend_tracker
+                release_labels = group["release"].astype(str).tolist() if "release" in group.columns else []
+                customdata = (
+                    np.array(release_labels, dtype=object).reshape(-1, 1)
+                    if release_labels
+                    else None
+                )
+                if customdata is not None:
+                    hovertemplate = (
+                        "Release %{customdata[0]}<br>Minutes %{x:.0f}<br>Normalized price %{y:.2f}<extra>"
+                        f"{category}</extra>"
+                    )
+                else:
+                    hovertemplate = (
+                        "Minutes %{x:.0f}<br>Normalized price %{y:.2f}<extra>"
+                        f"{category}</extra>"
+                    )
+                fig.add_trace(
+                    go.Scatter(
+                        x=group["minutes"].astype(float),
+                        y=group["normalized_price"].astype(float),
+                        mode="lines",
+                        name=category,
+                        legendgroup=legendgroup,
+                        showlegend=showlegend,
+                        line=dict(color=color, width=1.5),
+                        customdata=customdata,
+                        hovertemplate=hovertemplate,
+                    )
+                )
+                legend_tracker.add(category)
             fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
             fig.add_hline(y=100, line_dash="dot", line_color="#94a3b8")
             fig.update_layout(
                 title="Normalized BTC price trajectories",
                 xaxis_title="Minutes from release",
                 yaxis_title="Normalized price (release = 100)",
+            )
+            point_counts = [len(getattr(trace, "x", []) or []) for trace in fig.data]
+            logger.debug(
+                "Price trajectory traces generated: %d (point_counts=%s)",
+                len(fig.data),
+                point_counts,
             )
             return fig
 
