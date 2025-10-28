@@ -568,6 +568,12 @@ def analyze(
         help="Open the generated HTML dashboard in a browser.",
         show_default=False,
     ),
+    dashboard_backend: str = typer.Option(
+        "plotly-cdn",
+        "--dashboard-backend",
+        help="Dashboard backend to use: 'plotly-cdn', 'plotly-inline', or 'mpld3'.",
+        show_default=True,
+    ),
     plot: bool = typer.Option(
         False,
         "--plot/--no-plot",
@@ -694,6 +700,12 @@ def analyze(
     _export_report(result.events, output, fmt)
     typer.echo(f"Saved detailed report to {output.resolve()}")
 
+    backend_choice = dashboard_backend.strip().lower()
+    if backend_choice not in {"plotly-cdn", "plotly-inline", "mpld3"}:
+        raise typer.BadParameter(
+            "dashboard-backend must be one of 'plotly-cdn', 'plotly-inline', or 'mpld3'."
+        )
+
     html_output_path = _normalize_html_output_option(html_output)
     if html_output_path is None:
         if open_html:
@@ -707,6 +719,7 @@ def analyze(
                 config=analysis_config,
                 output_path=html_output_path,
                 open_browser=open_html,
+                dashboard_backend=backend_choice,
             )
         except ImportError as exc:  # pragma: no cover - dependency guard
             raise typer.BadParameter(
