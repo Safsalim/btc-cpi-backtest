@@ -1180,7 +1180,7 @@ class DashboardBuilder:
       if (value === null || value === undefined || Number.isNaN(value)) {{
         return '—';
       }}
-      return `${Number(value).toFixed(digits)}%`;
+      return `${{Number(value).toFixed(digits)}}%`;
     }}
 
     function populateSummaryCards() {{
@@ -1190,9 +1190,9 @@ class DashboardBuilder:
         const element = document.createElement('article');
         element.className = 'summary-card';
         element.innerHTML = `
-          <span class="label">${card.label}</span>
-          <span class="value">${card.value}</span>
-          <span class="description">${card.description}</span>
+          <span class="label">${{card.label}}</span>
+          <span class="value">${{card.value}}</span>
+          <span class="description">${{card.description}}</span>
         `;
         node.appendChild(element);
       }});
@@ -1212,7 +1212,7 @@ class DashboardBuilder:
         const chartId = chartNode.id;
         if (rendered.has(chartId)) return;
         chartNode.innerHTML = '<p style="color: var(--text-secondary);">No data available for this chart.</p>';
-        card.querySelectorAll(`button[data-chart-id="${chartId}"]`).forEach(button => {{
+        card.querySelectorAll(`button[data-chart-id="${{chartId}}"]`).forEach(button => {{
           button.disabled = true;
           button.style.opacity = '0.55';
           button.style.cursor = 'not-allowed';
@@ -1230,7 +1230,7 @@ class DashboardBuilder:
           if (!node) return;
           Plotly.downloadImage(node, {{
             format,
-            filename: `btc-cpi-dashboard_${chartId}`,
+            filename: `btc-cpi-dashboard_${{chartId}}`,
             height: 600,
             width: 900,
             scale: 2,
@@ -1244,13 +1244,13 @@ class DashboardBuilder:
       element.dataset.rowId = row.id;
       const reactionLabels = Object.entries(row.reactionReturns)
         .filter(([, value]) => value !== null && !Number.isNaN(value))
-        .map(([label, value]) => `${label}: ${formatPercentage(value)}`)
+        .map(([label, value]) => `${{label}}: ${{formatPercentage(value)}}`)
         .join('<br />');
       const evaluationLabels = Object.entries(row.evaluationReturns)
         .filter(([, value]) => value !== null && !Number.isNaN(value))
-        .map(([label, value]) => `${label}: ${formatPercentage(value)}`)
+        .map(([label, value]) => `${{label}}: ${{formatPercentage(value)}}`)
         .join('<br />');
-      const fakeDuration = row.fakeDurationMinutes ? `${row.fakeDurationMinutes} min` : '—';
+      const fakeDuration = row.fakeDurationMinutes ? `${{row.fakeDurationMinutes}} min` : '—';
       const cells = [
         ['Release', row.releaseLabel],
         ['Actual', formatNumber(row.actual, 2)],
@@ -1335,7 +1335,7 @@ class DashboardBuilder:
 
     function formatDetailValue(value, suffix='') {{
       if (value === null || value === undefined || Number.isNaN(value)) return '—';
-      return `${Number(value).toFixed(2)}${suffix}`;
+      return `${{Number(value).toFixed(2)}}${{suffix}}`;
     }}
 
     function updateDetailPanel(row) {{
@@ -1344,7 +1344,7 @@ class DashboardBuilder:
       document.getElementById('detail-expected').textContent = formatDetailValue(row.expected);
       document.getElementById('detail-surprise').textContent = formatDetailValue(row.surprise);
       document.getElementById('detail-outcome').textContent = row.outcome;
-      document.getElementById('detail-reversal').textContent = row.fakeDurationMinutes ? `${row.fakeDurationMinutes} min` : '—';
+      document.getElementById('detail-reversal').textContent = row.fakeDurationMinutes ? `${{row.fakeDurationMinutes}} min` : '—';
 
       const surpriseValue = Number(row.surprise);
       const surpriseElement = document.getElementById('detail-surprise');
