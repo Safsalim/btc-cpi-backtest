@@ -74,6 +74,48 @@ def _clean_numeric(value: Any) -> float | None:
     return numeric
 
 
+def _normalize_numeric_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(dtype="float64", index=series.index)
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    cleaned = series.astype(str).str.strip()
+    cleaned = cleaned.replace({"": np.nan}, regex=False)
+    cleaned = cleaned.replace(
+        to_replace=r"(?i)^(nan|none|n/?a|n\\.a\\.?|--|—)$",
+        value=np.nan,
+        regex=True,
+    )
+    cleaned = cleaned.str.replace("%", "", regex=False)
+    cleaned = cleaned.str.replace(",", "", regex=False)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def _normalize_boolean_series(series: pd.Series) -> pd.Series:
+    if series.empty:
+        return pd.Series(pd.array([], dtype="boolean"), index=series.index)
+
+    values: list[object] = []
+    for value in series:
+        if pd.isna(value):
+            values.append(pd.NA)
+            continue
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "t", "1", "yes"}:
+                values.append(True)
+                continue
+            if normalized in {"false", "f", "0", "no"}:
+                values.append(False)
+                continue
+        try:
+            values.append(bool(value))
+        except Exception:  # pragma: no cover - defensive guard
+            values.append(pd.NA)
+    return pd.Series(pd.array(values, dtype="boolean"), index=series.index)
+
+
 def _price_at(series: pd.Series, timestamp: pd.Timestamp | None) -> float | None:
     if timestamp is None:
         return None
@@ -185,7 +227,7 @@ class DashboardBuilder:
         )
 
         if "cpi_surprise" in events.columns:
-            events["cpi_surprise"] = pd.to_numeric(events["cpi_surprise"], errors="coerce")
+            events["cpi_surprise"] = _normalize_numeric_series(events["cpi_surprise"])
         else:
             events["cpi_surprise"] = pd.Series(
                 [math.nan] * len(events),
@@ -193,9 +235,13 @@ class DashboardBuilder:
                 dtype="float64",
             )
 
+        if "cpi_actual" in events.columns:
+            events["cpi_actual"] = _normalize_numeric_series(events["cpi_actual"])
+        if "cpi_expected" in events.columns:
+            events["cpi_expected"] = _normalize_numeric_series(events["cpi_expected"])
         if "cpi_actual" in events.columns and "cpi_expected" in events.columns:
-            actual_series = pd.to_numeric(events["cpi_actual"], errors="coerce")
-            expected_series = pd.to_numeric(events["cpi_expected"], errors="coerce")
+            actual_series = events["cpi_actual"]
+            expected_series = events["cpi_expected"]
             fallback_surprise = actual_series - expected_series
             missing_mask = events["cpi_surprise"].isna()
             if missing_mask.all() and len(events) > 0:
@@ -211,14 +257,71 @@ class DashboardBuilder:
                     int(missing_mask.sum()),
                 )
 
-        if "base_price" not in events.columns:
-            events["base_price"] = np.nan
+        if "base_price" in events.columns:
+            events["base_price"] = _normalize_numeric_series(events["base_price"])
+        else:
+            events["base_price"] = pd.Series(
+                [math.nan] * len(events),
+                index=events.index,
+                dtype="float64",
+            )
+
+        if "fake_duration_minutes" in events.columns:
+            events["fake_duration_minutes"] = _normalize_numeric_series(
+                events["fake_duration_minutes"]
+            ).astype("Float64")
+        else:
+            events["fake_duration_minutes"] = pd.Series(
+                [math.nan] * len(events),
+                index=events.index,
+                dtype="Float64",
+            )
+
+        if "initial_reaction_return" in events.columns:
+            events["initial_reaction_return"] = _normalize_numeric_series(
+                events["initial_reaction_return"]
+            ).astype("Float64")
+        else:
+            events["initial_reaction_return"] = pd.Series(
+                [math.nan] * len(events),
+                index=events.index,
+                dtype="Float64",
+            )
+
+        if "initial_reaction_return_pct" in events.columns:
+            events["initial_reaction_return_pct"] = _normalize_numeric_series(
+                events["initial_reaction_return_pct"]
+            ).astype("Float64")
+        else:
+            fallback_pct: pd.Series | None = None
+            if self._reaction_labels:
+                primary_reaction = self._reaction_labels[0]
+                pct_candidate = f"return_{primary_reaction}_pct"
+                base_candidate = f"return_{primary_reaction}"
+                if pct_candidate in events.columns:
+                    fallback_pct = _normalize_numeric_series(events[pct_candidate])
+                elif base_candidate in events.columns:
+                    fallback_pct = _normalize_numeric_series(events[base_candidate]) * 100.0
+            if fallback_pct is not None:
+                events["initial_reaction_return_pct"] = fallback_pct.astype("Float64")
+            else:
+                events["initial_reaction_return_pct"] = pd.Series(
+                    [math.nan] * len(events),
+                    index=events.index,
+                    dtype="Float64",
+                )
 
         combined_windows = self._reaction_windows + self._evaluation_windows
         for label, _ in combined_windows:
             column_name = f"return_{label}"
-            if column_name not in events.columns:
-                events[column_name] = np.nan
+            if column_name in events.columns:
+                events[column_name] = _normalize_numeric_series(events[column_name]).astype("Float64")
+            else:
+                events[column_name] = pd.Series(
+                    [math.nan] * len(events),
+                    index=events.index,
+                    dtype="Float64",
+                )
 
         tolerance = self._config.tolerance
         if not price_series.empty and "release_datetime" in events.columns:
@@ -255,12 +358,11 @@ class DashboardBuilder:
             for evaluation_label in self._evaluation_labels:
                 fake_column = f"fake_{reaction_label}_{evaluation_label}"
                 if fake_column in events.columns:
-                    events[fake_column] = events[fake_column].astype("boolean")
+                    events[fake_column] = _normalize_boolean_series(events[fake_column])
                 else:
                     events[fake_column] = pd.Series(
-                        [pd.NA] * len(events),
+                        pd.array([pd.NA] * len(events), dtype="boolean"),
                         index=events.index,
-                        dtype="boolean",
                     )
 
         if combined_windows and not events.empty:
@@ -683,18 +785,22 @@ class DashboardBuilder:
             if "cpi_surprise" not in events.columns:
                 logger.debug("CPI surprise distribution chart aborted: missing 'cpi_surprise' column")
                 return None
-            surprises = events["cpi_surprise"].dropna().astype(float)
+            surprises = pd.to_numeric(events["cpi_surprise"], errors="coerce").dropna()
             if surprises.empty:
                 logger.debug("CPI surprise distribution chart aborted: no non-null surprises available")
                 return None
             sample_count = int(surprises.size)
             min_surprise = float(surprises.min())
             max_surprise = float(surprises.max())
+            range_min = min(-0.3, min_surprise)
+            range_max = max(0.6, max_surprise)
             logger.debug(
-                "CPI surprise distribution dataset: count=%d, min=%.3f, max=%.3f",
+                "CPI surprise distribution dataset: count=%d, min=%.3f, max=%.3f, range=[%.3f, %.3f]",
                 sample_count,
                 min_surprise,
                 max_surprise,
+                range_min,
+                range_max,
             )
             nbins = min(30, max(10, int(math.sqrt(sample_count))))
             surprise_df = pd.DataFrame({"cpi_surprise": surprises})
@@ -702,8 +808,10 @@ class DashboardBuilder:
                 surprise_df,
                 x="cpi_surprise",
                 nbins=nbins,
+                range_x=[range_min, range_max],
             )
             fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
+            fig.update_xaxes(range=[range_min, range_max])
             fig.update_layout(
                 title="Distribution of CPI surprises",
                 xaxis_title="Surprise (actual - expected, %)",
@@ -727,26 +835,52 @@ class DashboardBuilder:
                 "release_datetime",
             ]
             available_columns = [column for column in working_columns if column in events.columns]
-            df = events[available_columns].dropna(subset=["cpi_surprise", "initial_reaction_return_pct"])
+            df = events[available_columns].copy()
+            df["cpi_surprise"] = pd.to_numeric(df["cpi_surprise"], errors="coerce")
+            df["initial_reaction_return_pct"] = pd.to_numeric(
+                df["initial_reaction_return_pct"], errors="coerce"
+            )
+            df = df.dropna(subset=["cpi_surprise", "initial_reaction_return_pct"])
             if df.empty:
                 logger.debug("Reaction vs surprise chart aborted: no complete surprise/reaction pairs")
                 return None
-            df = df.copy()
-
-            def _classify_outcome(value: Any) -> str:
-                if pd.isna(value):
-                    return "Incomplete"
-                return "Fake move" if bool(value) else "Sustained move"
 
             if "fake_any" in df.columns:
-                df["outcome"] = df["fake_any"].apply(_classify_outcome)
+                def _normalize_flag(value: Any) -> object:
+                    if pd.isna(value):
+                        return pd.NA
+                    if isinstance(value, str):
+                        normalized = value.strip().lower()
+                        if normalized in {"true", "t", "1", "yes"}:
+                            return True
+                        if normalized in {"false", "f", "0", "no"}:
+                            return False
+                        if normalized in {"", "nan", "n/a", "na", "none", "null", "--", "—"}:
+                            return pd.NA
+                    try:
+                        return bool(value)
+                    except Exception:  # pragma: no cover - defensive guard
+                        return pd.NA
+
+                df["fake_flag"] = df["fake_any"].apply(_normalize_flag)
+                df["outcome"] = df["fake_flag"].map({True: "Fake move", False: "Sustained move"}).fillna(
+                    "Incomplete"
+                )
             else:
                 df["outcome"] = "Unknown"
             outcome_counts = df["outcome"].value_counts(dropna=False).to_dict()
+            surprise_min = float(df["cpi_surprise"].min())
+            surprise_max = float(df["cpi_surprise"].max())
+            reaction_min = float(df["initial_reaction_return_pct"].min())
+            reaction_max = float(df["initial_reaction_return_pct"].max())
             logger.debug(
-                "Reaction vs surprise dataset: rows=%d, outcome_counts=%s",
+                "Reaction vs surprise dataset: rows=%d, outcome_counts=%s, surprise_range=(%.3f, %.3f), reaction_range=(%.3f, %.3f)",
                 len(df),
                 outcome_counts,
+                surprise_min,
+                surprise_max,
+                reaction_min,
+                reaction_max,
             )
             fig = px.scatter(
                 df,
@@ -754,6 +888,13 @@ class DashboardBuilder:
                 y="initial_reaction_return_pct",
                 color="outcome",
                 hover_name="release_datetime" if "release_datetime" in df.columns else None,
+                category_orders={"outcome": ["Fake move", "Sustained move", "Incomplete", "Unknown"]},
+                color_discrete_map={
+                    "Fake move": "#EF553B",
+                    "Sustained move": "#636EFA",
+                    "Incomplete": "#94a3b8",
+                    "Unknown": "#a855f7",
+                },
             )
             if len(df) >= 2:
                 x_vals = df["cpi_surprise"].astype(float).to_numpy()
@@ -859,19 +1000,27 @@ class DashboardBuilder:
                     missing_columns,
                 )
                 return None
-            fake_mask = events["fake_any"].fillna(False).astype(bool)
-            series = events.loc[fake_mask, "fake_duration_minutes"].dropna().astype(float)
+            fake_flags = _normalize_boolean_series(events["fake_any"])
+            fake_mask = fake_flags.fillna(False).astype(bool)
+            series = pd.to_numeric(
+                events.loc[fake_mask, "fake_duration_minutes"],
+                errors="coerce",
+            ).dropna()
             if series.empty:
                 logger.debug("Fake duration chart aborted: no durations for confirmed fake moves")
                 return None
             sample_count = int(series.size)
             mean_value = float(series.mean())
             median_value = float(series.median())
+            min_value = float(series.min())
+            max_value = float(series.max())
             logger.debug(
-                "Fake duration dataset: count=%d, mean=%.2f, median=%.2f",
+                "Fake duration dataset: count=%d, mean=%.2f, median=%.2f, range=[%.2f, %.2f]",
                 sample_count,
                 mean_value,
                 median_value,
+                min_value,
+                max_value,
             )
             nbins = min(30, max(6, int(sample_count ** 0.5)))
             fig = go.Figure()
