@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+
+from plotly import io as pio
 
 from btc_cpi_backtest.analysis import FakeoutConfig, analyze_fakeouts
 from btc_cpi_backtest.cpi_loader import load_sample_cpi_data
@@ -33,10 +36,14 @@ def test_render_dashboard_html(tmp_path: Path) -> None:
 
     assert "BTC vs CPI Fake-out Dashboard" in html_content
     assert "fake_by_window" in html_content
+    assert 'id="timeline"' in html_content
     assert "tableRows" in html_content
     assert "figureMessages" in html_content
     assert "Plotly" in html_content
     assert "cdn.plot.ly" not in html_content
+
+    for removed_id in ("surprise_distribution", "reaction_vs_surprise", "fake_durations", "price_trajectories"):
+        assert removed_id not in html_content
 
 
 def test_individual_chart_builders(tmp_path: Path) -> None:
@@ -51,22 +58,33 @@ def test_individual_chart_builders(tmp_path: Path) -> None:
         config=FakeoutConfig(),
         plotly_js_mode="inline",
     )
-    builder._prepare_events()
 
-    chart_builders = {
-        "surprise_distribution": builder._build_surprise_distribution,
-        "reaction_vs_surprise": builder._build_reaction_scatter,
-        "fake_duration": builder._build_duration_histogram,
-        "price_trajectories": builder._build_price_trajectories,
+    html_output = builder.build_html()
+    assert "timeline" in html_output
+
+    expected_charts = {
+        "timeline",
+        "fake_by_window",
+        "fake_probability",
+        "fake_by_surprise",
+        "duration_by_surprise",
     }
+    assert expected_charts.issubset(builder._figures.keys())
 
-    for name, build in chart_builders.items():
-        fig = build()
-        assert fig is not None, f"{name} returned no figure"
-        print(f"{name} traces: {len(fig.data)}")
-        assert len(fig.data) > 0
-        print(f"{name} first trace: {fig.data[0]}")
-        output_file = tmp_path / f"{name}.html"
-        fig.write_html(str(output_file))
+    for chart_id in expected_charts:
+        payload = builder._figures[chart_id]
+        figure = pio.from_json(json.dumps(payload))
+        assert figure.data, f"{chart_id} produced no traces"
+        output_file = tmp_path / f"{chart_id}.html"
+        figure.write_html(str(output_file))
         assert output_file.exists()
         assert output_file.stat().st_size > 0
+
+    removed_charts = {
+        "surprise_distribution",
+        "reaction_vs_surprise",
+        "fake_durations",
+        "price_trajectories",
+    }
+    assert removed_charts.isdisjoint(builder._figures.keys())
+    assert removed_charts.isdisjoint(builder._figure_messages.keys())
