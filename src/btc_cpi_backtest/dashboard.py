@@ -14,7 +14,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly import io as pio
-from plotly.subplots import make_subplots
+
 
 from .analysis import (
     FakeoutAnalysisResult,
@@ -622,142 +622,6 @@ class DashboardBuilder:
 
         self._summary_cards = cards
 
-    def _build_surprise_distribution(self) -> go.Figure | None:
-        events = self._events
-        if events.empty or "cpi_surprise" not in events.columns:
-            return None
-        surprises = pd.to_numeric(events["cpi_surprise"], errors="coerce").dropna()
-        if surprises.empty:
-            return None
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=surprises, nbinsx=20))
-        fig.update_layout(
-            title="CPI Surprise Distribution",
-            xaxis_title="Surprise (%)",
-            yaxis_title="Count",
-            height=450,
-        )
-        fig.add_vline(x=0, line_dash="dash", line_color="red")
-        return fig
-
-    def _build_reaction_scatter(self) -> go.Figure | None:
-        events = self._events
-        columns = ["cpi_surprise", "initial_reaction_return_pct"]
-        if events.empty or any(column not in events.columns for column in columns):
-            return None
-        df = events[columns].apply(pd.to_numeric, errors="coerce").dropna()
-        if df.empty:
-            return None
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=df["cpi_surprise"],
-                y=df["initial_reaction_return_pct"],
-                mode="markers",
-            )
-        )
-        fig.update_layout(
-            title="Reaction vs Surprise",
-            xaxis_title="CPI Surprise (%)",
-            yaxis_title="Price Reaction (%)",
-            height=450,
-        )
-        return fig
-
-    def _build_duration_histogram(self) -> go.Figure | None:
-        events = self._events
-        if (
-            events.empty
-            or "fake_any" not in events.columns
-            or "fake_duration_minutes" not in events.columns
-        ):
-            return None
-        fake_mask = events["fake_any"].eq(True).fillna(False)
-        if not fake_mask.any():
-            return None
-        durations = pd.to_numeric(
-            events.loc[fake_mask, "fake_duration_minutes"],
-            errors="coerce",
-        ).dropna()
-        if durations.empty:
-            return None
-        fig = go.Figure()
-        fig.add_trace(go.Histogram(x=durations, nbinsx=15))
-        fig.update_layout(
-            title="Fake Move Duration",
-            xaxis_title="Minutes",
-            yaxis_title="Count",
-            height=450,
-        )
-        return fig
-
-    def _build_price_trajectories(self) -> go.Figure | None:
-        events = self._events
-        price_series = self._price_series
-        if (
-            events.empty
-            or price_series.empty
-            or "release_datetime" not in events.columns
-            or "fake_any" not in events.columns
-        ):
-            return None
-        price_series = price_series.sort_index().dropna()
-        if price_series.empty:
-            return None
-        fake_series = events["fake_any"]
-        release_mask = events["release_datetime"].notna()
-        samples = [
-            ("Fake", events.loc[fake_series.eq(True).fillna(False) & release_mask].head(3)),
-            ("Sustained", events.loc[fake_series.eq(False).fillna(False) & release_mask].head(3)),
-        ]
-        if all(sample.empty for _, sample in samples):
-            samples = [("Event", events.loc[release_mask].head(3))]
-        fig = go.Figure()
-        price_tz = getattr(price_series.index, "tz", None)
-        for label, sample in samples:
-            for idx, row in sample.iterrows():
-                release_value = row.get("release_datetime")
-                if pd.isna(release_value):
-                    continue
-                release_ts = pd.Timestamp(release_value)
-                if price_tz is not None:
-                    if release_ts.tzinfo is None:
-                        release_ts = release_ts.tz_localize(price_tz)
-                    else:
-                        release_ts = release_ts.tz_convert(price_tz)
-                elif release_ts.tzinfo is not None:
-                    release_ts = release_ts.tz_convert(None)
-                window_start = release_ts - pd.Timedelta(hours=1)
-                window_end = release_ts + pd.Timedelta(hours=4)
-                prices = price_series.loc[window_start:window_end]
-                if prices.empty:
-                    continue
-                base_value = prices.iloc[0]
-                if pd.isna(base_value):
-                    continue
-                base_value = float(base_value)
-                if base_value == 0.0:
-                    continue
-                norm_prices = (prices / base_value) * 100.0
-                times = [(ts - release_ts).total_seconds() / 3600 for ts in norm_prices.index]
-                fig.add_trace(
-                    go.Scatter(
-                        x=times,
-                        y=norm_prices.to_numpy(),
-                        mode="lines",
-                        name=f"{label} {idx}",
-                    )
-                )
-        if len(fig.data) == 0:
-            return None
-        fig.update_layout(
-            title="Price Trajectories",
-            xaxis_title="Hours from Release",
-            yaxis_title="Normalized Price (100 at release)",
-            height=450,
-        )
-        return fig
-
     def _build_figures(self) -> None:
         events = self._events
         figures: Dict[str, dict[str, Any]] = {}
@@ -1014,29 +878,14 @@ class DashboardBuilder:
             return fig
 
         register(
-            "fake_by_window",
-            build_fake_by_window,
-            "No evaluation windows contain fake-out data.",
-        )
-        register(
-            "fake_by_surprise",
-            build_fake_by_surprise_type,
-            "No fake-out data available by surprise category.",
-        )
-        register(
             "timeline",
             build_timeline,
             "Evaluation window returns are required to plot the timeline.",
         )
         register(
-            "surprise_distribution",
-            self._build_surprise_distribution,
-            "CPI surprise data is unavailable.",
-        )
-        register(
-            "reaction_vs_surprise",
-            self._build_reaction_scatter,
-            "Need CPI surprise values and reaction returns to build this chart.",
+            "fake_by_window",
+            build_fake_by_window,
+            "No evaluation windows contain fake-out data.",
         )
         register(
             "fake_probability",
@@ -1044,19 +893,14 @@ class DashboardBuilder:
             "Need fake-out classifications and CPI surprises to estimate probabilities.",
         )
         register(
-            "fake_durations",
-            self._build_duration_histogram,
-            "Fake-out durations are unavailable for this dataset.",
+            "fake_by_surprise",
+            build_fake_by_surprise_type,
+            "No fake-out data available by surprise category.",
         )
         register(
             "duration_by_surprise",
             build_duration_by_surprise,
             "Fake-out durations by surprise type are unavailable.",
-        )
-        register(
-            "price_trajectories",
-            self._build_price_trajectories,
-            "Price history around CPI releases is required to show trajectories.",
         )
 
         self._figures = figures
@@ -1300,6 +1144,9 @@ class DashboardBuilder:
       flex-direction: column;
       gap: 1rem;
     }}
+    .chart-card.full-width {{
+      grid-column: 1 / -1;
+    }}
     .chart-card header {{
       margin: 0;
       display: flex;
@@ -1482,96 +1329,56 @@ class DashboardBuilder:
       <p>Interactive exploration of CPI releases and Bitcoin price reactions. Click rows for event-level insights and hover charts for details.</p>
     </header>
     <section class=\"summary-grid\" id=\"summary-cards\"></section>
-    <section class=\"chart-grid\" id=\"overview-section\">
-      <div class=\"chart-card\">
-        <header>
-          <h2>Fake-out rates by evaluation window</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"fake_by_window\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"fake_by_window\" data-download-format=\"svg\">Export SVG</button>
-          </div>
-        </header>
-        <div id=\"fake_by_window\"></div>
-      </div>
-      <div class=\"chart-card\">
-        <header>
-          <h2>Fake-out rates by surprise type</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"fake_by_surprise\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"fake_by_surprise\" data-download-format=\"svg\">Export SVG</button>
-          </div>
-        </header>
-        <div id=\"fake_by_surprise\"></div>
-      </div>
-      <div class=\"chart-card\">
+    <section class="chart-grid" id="overview-section">
+      <div class="chart-card full-width">
         <header>
           <h2>CPI release timeline</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"timeline\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"timeline\" data-download-format=\"svg\">Export SVG</button>
+          <div class="actions">
+            <button data-chart-id="timeline" data-download-format="png">Export PNG</button>
+            <button data-chart-id="timeline" data-download-format="svg">Export SVG</button>
           </div>
         </header>
-        <div id=\"timeline\"></div>
+        <div id="timeline"></div>
       </div>
-      <div class=\"chart-card\">
+      <div class="chart-card full-width">
         <header>
-          <h2>CPI surprise distribution</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"surprise_distribution\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"surprise_distribution\" data-download-format=\"svg\">Export SVG</button>
+          <h2>Fake-out rates by evaluation window</h2>
+          <div class="actions">
+            <button data-chart-id="fake_by_window" data-download-format="png">Export PNG</button>
+            <button data-chart-id="fake_by_window" data-download-format="svg">Export SVG</button>
           </div>
         </header>
-        <div id=\"surprise_distribution\"></div>
+        <div id="fake_by_window"></div>
       </div>
-      <div class=\"chart-card\">
-        <header>
-          <h2>Reaction vs surprise</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"reaction_vs_surprise\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"reaction_vs_surprise\" data-download-format=\"svg\">Export SVG</button>
-          </div>
-        </header>
-        <div id=\"reaction_vs_surprise\"></div>
-      </div>
-      <div class=\"chart-card\">
+      <div class="chart-card full-width">
         <header>
           <h2>Fake probability vs surprise</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"fake_probability\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"fake_probability\" data-download-format=\"svg\">Export SVG</button>
+          <div class="actions">
+            <button data-chart-id="fake_probability" data-download-format="png">Export PNG</button>
+            <button data-chart-id="fake_probability" data-download-format="svg">Export SVG</button>
           </div>
         </header>
-        <div id=\"fake_probability\"></div>
+        <div id="fake_probability"></div>
       </div>
-      <div class=\"chart-card\">
+      <div class="chart-card">
         <header>
-          <h2>Fake move duration</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"fake_durations\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"fake_durations\" data-download-format=\"svg\">Export SVG</button>
+          <h2>Fake-out rates by surprise type</h2>
+          <div class="actions">
+            <button data-chart-id="fake_by_surprise" data-download-format="png">Export PNG</button>
+            <button data-chart-id="fake_by_surprise" data-download-format="svg">Export SVG</button>
           </div>
         </header>
-        <div id=\"fake_durations\"></div>
+        <div id="fake_by_surprise"></div>
       </div>
-      <div class=\"chart-card\">
+      <div class="chart-card">
         <header>
           <h2>Reversal by surprise type</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"duration_by_surprise\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"duration_by_surprise\" data-download-format=\"svg\">Export SVG</button>
+          <div class="actions">
+            <button data-chart-id="duration_by_surprise" data-download-format="png">Export PNG</button>
+            <button data-chart-id="duration_by_surprise" data-download-format="svg">Export SVG</button>
           </div>
         </header>
-        <div id=\"duration_by_surprise\"></div>
-      </div>
-      <div class=\"chart-card\">
-        <header>
-          <h2>Price trajectories</h2>
-          <div class=\"actions\">
-            <button data-chart-id=\"price_trajectories\" data-download-format=\"png\">Export PNG</button>
-            <button data-chart-id=\"price_trajectories\" data-download-format=\"svg\">Export SVG</button>
-          </div>
-        </header>
-        <div id=\"price_trajectories\"></div>
+        <div id="duration_by_surprise"></div>
       </div>
     </section>
     <section class=\"detail-grid\">
