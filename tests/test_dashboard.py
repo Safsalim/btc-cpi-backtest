@@ -4,7 +4,11 @@ from pathlib import Path
 
 from btc_cpi_backtest.analysis import FakeoutConfig, analyze_fakeouts
 from btc_cpi_backtest.cpi_loader import load_sample_cpi_data
-from btc_cpi_backtest.dashboard import DEFAULT_DASHBOARD_PATH, render_dashboard_html
+from btc_cpi_backtest.dashboard import (
+    DEFAULT_DASHBOARD_PATH,
+    DashboardBuilder,
+    render_dashboard_html,
+)
 from btc_cpi_backtest.price_loader import load_sample_price_series
 
 
@@ -33,3 +37,36 @@ def test_render_dashboard_html(tmp_path: Path) -> None:
     assert "figureMessages" in html_content
     assert "Plotly" in html_content
     assert "cdn.plot.ly" not in html_content
+
+
+def test_individual_chart_builders(tmp_path: Path) -> None:
+    releases = load_sample_cpi_data()
+    price_series = load_sample_price_series()
+    result = analyze_fakeouts(releases, price_series, config=FakeoutConfig())
+
+    builder = DashboardBuilder(
+        result=result,
+        releases=releases,
+        price_series=price_series,
+        config=FakeoutConfig(),
+        plotly_js_mode="inline",
+    )
+    builder._prepare_events()
+
+    chart_builders = {
+        "surprise_distribution": builder._build_surprise_distribution,
+        "reaction_vs_surprise": builder._build_reaction_scatter,
+        "fake_duration": builder._build_duration_histogram,
+        "price_trajectories": builder._build_price_trajectories,
+    }
+
+    for name, build in chart_builders.items():
+        fig = build()
+        assert fig is not None, f"{name} returned no figure"
+        print(f"{name} traces: {len(fig.data)}")
+        assert len(fig.data) > 0
+        print(f"{name} first trace: {fig.data[0]}")
+        output_file = tmp_path / f"{name}.html"
+        fig.write_html(str(output_file))
+        assert output_file.exists()
+        assert output_file.stat().st_size > 0
