@@ -622,6 +622,142 @@ class DashboardBuilder:
 
         self._summary_cards = cards
 
+    def _build_surprise_distribution(self) -> go.Figure | None:
+        events = self._events
+        if events.empty or "cpi_surprise" not in events.columns:
+            return None
+        surprises = pd.to_numeric(events["cpi_surprise"], errors="coerce").dropna()
+        if surprises.empty:
+            return None
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=surprises, nbinsx=20))
+        fig.update_layout(
+            title="CPI Surprise Distribution",
+            xaxis_title="Surprise (%)",
+            yaxis_title="Count",
+            height=450,
+        )
+        fig.add_vline(x=0, line_dash="dash", line_color="red")
+        return fig
+
+    def _build_reaction_scatter(self) -> go.Figure | None:
+        events = self._events
+        columns = ["cpi_surprise", "initial_reaction_return_pct"]
+        if events.empty or any(column not in events.columns for column in columns):
+            return None
+        df = events[columns].apply(pd.to_numeric, errors="coerce").dropna()
+        if df.empty:
+            return None
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=df["cpi_surprise"],
+                y=df["initial_reaction_return_pct"],
+                mode="markers",
+            )
+        )
+        fig.update_layout(
+            title="Reaction vs Surprise",
+            xaxis_title="CPI Surprise (%)",
+            yaxis_title="Price Reaction (%)",
+            height=450,
+        )
+        return fig
+
+    def _build_duration_histogram(self) -> go.Figure | None:
+        events = self._events
+        if (
+            events.empty
+            or "fake_any" not in events.columns
+            or "fake_duration_minutes" not in events.columns
+        ):
+            return None
+        fake_mask = events["fake_any"].eq(True).fillna(False)
+        if not fake_mask.any():
+            return None
+        durations = pd.to_numeric(
+            events.loc[fake_mask, "fake_duration_minutes"],
+            errors="coerce",
+        ).dropna()
+        if durations.empty:
+            return None
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=durations, nbinsx=15))
+        fig.update_layout(
+            title="Fake Move Duration",
+            xaxis_title="Minutes",
+            yaxis_title="Count",
+            height=450,
+        )
+        return fig
+
+    def _build_price_trajectories(self) -> go.Figure | None:
+        events = self._events
+        price_series = self._price_series
+        if (
+            events.empty
+            or price_series.empty
+            or "release_datetime" not in events.columns
+            or "fake_any" not in events.columns
+        ):
+            return None
+        price_series = price_series.sort_index().dropna()
+        if price_series.empty:
+            return None
+        fake_series = events["fake_any"]
+        release_mask = events["release_datetime"].notna()
+        samples = [
+            ("Fake", events.loc[fake_series.eq(True).fillna(False) & release_mask].head(3)),
+            ("Sustained", events.loc[fake_series.eq(False).fillna(False) & release_mask].head(3)),
+        ]
+        if all(sample.empty for _, sample in samples):
+            samples = [("Event", events.loc[release_mask].head(3))]
+        fig = go.Figure()
+        price_tz = getattr(price_series.index, "tz", None)
+        for label, sample in samples:
+            for idx, row in sample.iterrows():
+                release_value = row.get("release_datetime")
+                if pd.isna(release_value):
+                    continue
+                release_ts = pd.Timestamp(release_value)
+                if price_tz is not None:
+                    if release_ts.tzinfo is None:
+                        release_ts = release_ts.tz_localize(price_tz)
+                    else:
+                        release_ts = release_ts.tz_convert(price_tz)
+                elif release_ts.tzinfo is not None:
+                    release_ts = release_ts.tz_convert(None)
+                window_start = release_ts - pd.Timedelta(hours=1)
+                window_end = release_ts + pd.Timedelta(hours=4)
+                prices = price_series.loc[window_start:window_end]
+                if prices.empty:
+                    continue
+                base_value = prices.iloc[0]
+                if pd.isna(base_value):
+                    continue
+                base_value = float(base_value)
+                if base_value == 0.0:
+                    continue
+                norm_prices = (prices / base_value) * 100.0
+                times = [(ts - release_ts).total_seconds() / 3600 for ts in norm_prices.index]
+                fig.add_trace(
+                    go.Scatter(
+                        x=times,
+                        y=norm_prices.to_numpy(),
+                        mode="lines",
+                        name=f"{label} {idx}",
+                    )
+                )
+        if len(fig.data) == 0:
+            return None
+        fig.update_layout(
+            title="Price Trajectories",
+            xaxis_title="Hours from Release",
+            yaxis_title="Normalized Price (100 at release)",
+            height=450,
+        )
+        return fig
+
     def _build_figures(self) -> None:
         events = self._events
         figures: Dict[str, dict[str, Any]] = {}
@@ -781,148 +917,6 @@ class DashboardBuilder:
             )
             return fig
 
-        def build_surprise_distribution() -> go.Figure | None:
-            if "cpi_surprise" not in events.columns:
-                logger.debug("CPI surprise distribution chart aborted: missing 'cpi_surprise' column")
-                return None
-            surprises = pd.to_numeric(events["cpi_surprise"], errors="coerce").dropna()
-            if surprises.empty:
-                logger.debug("CPI surprise distribution chart aborted: no non-null surprises available")
-                return None
-            sample_count = int(surprises.size)
-            min_surprise = float(surprises.min())
-            max_surprise = float(surprises.max())
-            range_min = min(-0.3, min_surprise)
-            range_max = max(0.6, max_surprise)
-            logger.debug(
-                "CPI surprise distribution dataset: count=%d, min=%.3f, max=%.3f, range=[%.3f, %.3f]",
-                sample_count,
-                min_surprise,
-                max_surprise,
-                range_min,
-                range_max,
-            )
-            nbins = min(30, max(10, int(math.sqrt(sample_count))))
-            surprise_df = pd.DataFrame({"cpi_surprise": surprises})
-            fig = px.histogram(
-                surprise_df,
-                x="cpi_surprise",
-                nbins=nbins,
-                range_x=[range_min, range_max],
-            )
-            fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
-            fig.update_xaxes(range=[range_min, range_max])
-            fig.update_layout(
-                title="Distribution of CPI surprises",
-                xaxis_title="Surprise (actual - expected, %)",
-                yaxis_title="Count",
-            )
-            return fig
-
-        def build_reaction_vs_surprise() -> go.Figure | None:
-            required_columns = {"cpi_surprise", "initial_reaction_return_pct"}
-            missing_columns = [column for column in required_columns if column not in events.columns]
-            if missing_columns:
-                logger.debug(
-                    "Reaction vs surprise chart aborted: missing columns %s",
-                    missing_columns,
-                )
-                return None
-            working_columns = [
-                "cpi_surprise",
-                "initial_reaction_return_pct",
-                "fake_any",
-                "release_datetime",
-            ]
-            available_columns = [column for column in working_columns if column in events.columns]
-            df = events[available_columns].copy()
-            df["cpi_surprise"] = pd.to_numeric(df["cpi_surprise"], errors="coerce")
-            df["initial_reaction_return_pct"] = pd.to_numeric(
-                df["initial_reaction_return_pct"], errors="coerce"
-            )
-            df = df.dropna(subset=["cpi_surprise", "initial_reaction_return_pct"])
-            if df.empty:
-                logger.debug("Reaction vs surprise chart aborted: no complete surprise/reaction pairs")
-                return None
-
-            if "fake_any" in df.columns:
-                def _normalize_flag(value: Any) -> object:
-                    if pd.isna(value):
-                        return pd.NA
-                    if isinstance(value, str):
-                        normalized = value.strip().lower()
-                        if normalized in {"true", "t", "1", "yes"}:
-                            return True
-                        if normalized in {"false", "f", "0", "no"}:
-                            return False
-                        if normalized in {"", "nan", "n/a", "na", "none", "null", "--", "—"}:
-                            return pd.NA
-                    try:
-                        return bool(value)
-                    except Exception:  # pragma: no cover - defensive guard
-                        return pd.NA
-
-                df["fake_flag"] = df["fake_any"].apply(_normalize_flag)
-                df["outcome"] = df["fake_flag"].map({True: "Fake move", False: "Sustained move"}).fillna(
-                    "Incomplete"
-                )
-            else:
-                df["outcome"] = "Unknown"
-            outcome_counts = df["outcome"].value_counts(dropna=False).to_dict()
-            surprise_min = float(df["cpi_surprise"].min())
-            surprise_max = float(df["cpi_surprise"].max())
-            reaction_min = float(df["initial_reaction_return_pct"].min())
-            reaction_max = float(df["initial_reaction_return_pct"].max())
-            logger.debug(
-                "Reaction vs surprise dataset: rows=%d, outcome_counts=%s, surprise_range=(%.3f, %.3f), reaction_range=(%.3f, %.3f)",
-                len(df),
-                outcome_counts,
-                surprise_min,
-                surprise_max,
-                reaction_min,
-                reaction_max,
-            )
-            fig = px.scatter(
-                df,
-                x="cpi_surprise",
-                y="initial_reaction_return_pct",
-                color="outcome",
-                hover_name="release_datetime" if "release_datetime" in df.columns else None,
-                category_orders={"outcome": ["Fake move", "Sustained move", "Incomplete", "Unknown"]},
-                color_discrete_map={
-                    "Fake move": "#EF553B",
-                    "Sustained move": "#636EFA",
-                    "Incomplete": "#94a3b8",
-                    "Unknown": "#a855f7",
-                },
-            )
-            if len(df) >= 2:
-                x_vals = df["cpi_surprise"].astype(float).to_numpy()
-                y_vals = df["initial_reaction_return_pct"].astype(float).to_numpy()
-                try:
-                    slope, intercept = np.polyfit(x_vals, y_vals, 1)
-                except (np.linalg.LinAlgError, ValueError) as exc:  # pragma: no cover - defensive guard
-                    logger.debug("Reaction vs surprise trendline skipped: %s", exc)
-                else:
-                    x_range = np.linspace(x_vals.min(), x_vals.max(), 100)
-                    fig.add_trace(
-                        go.Scatter(
-                            x=x_range,
-                            y=slope * x_range + intercept,
-                            mode="lines",
-                            name="Trendline",
-                            line=dict(color="#EF553B", width=2),
-                        )
-                    )
-            fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
-            fig.update_traces(marker=dict(size=10, opacity=0.85))
-            fig.update_layout(
-                title="Price reaction vs CPI surprise",
-                xaxis_title="CPI surprise (%)",
-                yaxis_title="Initial reaction return (%)",
-            )
-            return fig
-
         def build_fake_probability() -> go.Figure | None:
             required_columns = {"cpi_surprise", "fake_any"}
             missing_columns = [column for column in required_columns if column not in events.columns]
@@ -991,71 +985,6 @@ class DashboardBuilder:
             )
             return fig
 
-        def build_fake_duration_distribution() -> go.Figure | None:
-            required_columns = {"fake_duration_minutes", "fake_any"}
-            missing_columns = [column for column in required_columns if column not in events.columns]
-            if missing_columns:
-                logger.debug(
-                    "Fake duration chart aborted: missing columns %s",
-                    missing_columns,
-                )
-                return None
-            fake_flags = _normalize_boolean_series(events["fake_any"])
-            fake_mask = fake_flags.fillna(False).astype(bool)
-            series = pd.to_numeric(
-                events.loc[fake_mask, "fake_duration_minutes"],
-                errors="coerce",
-            ).dropna()
-            if series.empty:
-                logger.debug("Fake duration chart aborted: no durations for confirmed fake moves")
-                return None
-            sample_count = int(series.size)
-            mean_value = float(series.mean())
-            median_value = float(series.median())
-            min_value = float(series.min())
-            max_value = float(series.max())
-            logger.debug(
-                "Fake duration dataset: count=%d, mean=%.2f, median=%.2f, range=[%.2f, %.2f]",
-                sample_count,
-                mean_value,
-                median_value,
-                min_value,
-                max_value,
-            )
-            nbins = min(30, max(6, int(sample_count ** 0.5)))
-            fig = go.Figure()
-            fig.add_trace(
-                go.Histogram(
-                    x=series,
-                    nbinsx=nbins,
-                    marker_color="#636EFA",
-                    opacity=0.85,
-                    name="Durations",
-                )
-            )
-            fig.add_vline(
-                x=mean_value,
-                line_dash="dash",
-                line_color="#2563eb",
-                annotation_text=f"Mean {mean_value:.0f}m",
-                annotation_position="top right",
-            )
-            fig.add_vline(
-                x=median_value,
-                line_dash="dot",
-                line_color="#ef4444",
-                annotation_text=f"Median {median_value:.0f}m",
-                annotation_position="top left",
-            )
-            fig.update_layout(
-                title="Distribution of fake move durations",
-                xaxis_title="Minutes",
-                yaxis_title="Count",
-                bargap=0.05,
-                showlegend=False,
-            )
-            return fig
-
         def build_duration_by_surprise() -> go.Figure | None:
             if "fake_duration_minutes" not in events.columns:
                 return None
@@ -1084,95 +1013,6 @@ class DashboardBuilder:
             )
             return fig
 
-        def build_price_trajectories() -> go.Figure | None:
-            if self._price_series.empty:
-                logger.debug("Price trajectory chart aborted: price series is empty")
-                return None
-            if "fake_any" not in events.columns:
-                logger.debug("Price trajectory chart aborted: missing 'fake_any' column")
-                return None
-            categories = {"Fake move": 0, "Sustained move": 0}
-            max_per_category = 5
-            records: list[dict[str, float]] = []
-            price_series = self._price_series.sort_index()
-            price_tz = price_series.index.tz
-            for idx, row in events.iterrows():
-                fake_value = row.get("fake_any")
-                if pd.isna(fake_value):
-                    continue
-                category = "Fake move" if bool(fake_value) else "Sustained move"
-                if categories.get(category, 0) >= max_per_category:
-                    continue
-                release_value = row.get("release_datetime")
-                base_price = row.get("base_price")
-                if pd.isna(release_value):
-                    continue
-                release_ts = pd.Timestamp(release_value)
-                if release_ts.tzinfo is None:
-                    release_ts = release_ts.tz_localize(price_tz)
-                else:
-                    release_ts = release_ts.tz_convert(price_tz)
-                start = release_ts - self._price_window_before
-                end = release_ts + self._price_window_after
-                window = price_series.loc[start:end].dropna().copy()
-                if window.empty:
-                    continue
-                base_value: float | None
-                if base_price is None or (isinstance(base_price, float) and math.isnan(base_price)):
-                    base_value = _price_at(price_series, release_ts)
-                else:
-                    base_value = float(base_price)
-                if base_value is None or base_value == 0.0:
-                    continue
-                if release_ts not in window.index:
-                    window.loc[release_ts] = base_value
-                    window.sort_index(inplace=True)
-                normalized = (window / base_value) * 100.0
-                for ts, value in normalized.items():
-                    minutes = (ts - release_ts).total_seconds() / 60.0
-                    records.append(
-                        {
-                            "event_id": idx,
-                            "category": category,
-                            "minutes": minutes,
-                            "normalized_price": float(value),
-                            "release": release_ts.isoformat(),
-                        }
-                    )
-                categories[category] = categories.get(category, 0) + 1
-            logger.debug("Price trajectory sampling counts by category: %s", categories)
-            if not records:
-                logger.debug("Price trajectory chart aborted: no qualifying price windows found")
-                return None
-            df = pd.DataFrame(records)
-            if df.empty:
-                logger.debug("Price trajectory chart aborted: normalized dataset is empty")
-                return None
-            df.sort_values(["category", "event_id", "minutes"], inplace=True)
-            unique_events = df["event_id"].nunique()
-            logger.debug(
-                "Price trajectory chart using %d points from %d releases (categories=%s)",
-                len(df),
-                unique_events,
-                categories,
-            )
-            fig = px.line(
-                df,
-                x="minutes",
-                y="normalized_price",
-                color="category",
-                line_group="event_id",
-                hover_data={"release": True},
-            )
-            fig.add_vline(x=0, line_dash="dash", line_color="#EF4444")
-            fig.add_hline(y=100, line_dash="dot", line_color="#94a3b8")
-            fig.update_layout(
-                title="Normalized BTC price trajectories",
-                xaxis_title="Minutes from release",
-                yaxis_title="Normalized price (release = 100)",
-            )
-            return fig
-
         register(
             "fake_by_window",
             build_fake_by_window,
@@ -1190,12 +1030,12 @@ class DashboardBuilder:
         )
         register(
             "surprise_distribution",
-            build_surprise_distribution,
+            self._build_surprise_distribution,
             "CPI surprise data is unavailable.",
         )
         register(
             "reaction_vs_surprise",
-            build_reaction_vs_surprise,
+            self._build_reaction_scatter,
             "Need CPI surprise values and reaction returns to build this chart.",
         )
         register(
@@ -1205,7 +1045,7 @@ class DashboardBuilder:
         )
         register(
             "fake_durations",
-            build_fake_duration_distribution,
+            self._build_duration_histogram,
             "Fake-out durations are unavailable for this dataset.",
         )
         register(
@@ -1215,7 +1055,7 @@ class DashboardBuilder:
         )
         register(
             "price_trajectories",
-            build_price_trajectories,
+            self._build_price_trajectories,
             "Price history around CPI releases is required to show trajectories.",
         )
 
